@@ -1,0 +1,219 @@
+#pragma once
+
+#include <cstddef>
+#include <exception>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+
+#include "awaitable/core/coroutine.hpp"
+#include "awaitable/error.hpp"
+#include "awaitable/exec/detail/recycling_allocator.hpp"
+#include "awaitable/optional.hpp"
+#include "awaitable/this_coro.hpp"
+
+namespace aw {
+
+template <class T, class Executor> class awaitable;
+
+namespace detail {
+
+template <class Executor> class awaitable_thread;
+template <class Executor> class entry_frame_base;
+template <class Executor, class T, class Handler> class entry_frame_impl;
+
+// 帧 resume() 在栈上放一个，after_suspend 写进去（asio impl/awaitable.hpp:497-516）。
+struct resume_context {
+    void (*after_suspend_fn)(void*){nullptr};
+    void* after_suspend_arg{nullptr};
+};
+
+template <class T> struct dependent_false : std::false_type {};
+template <class...> struct make_void { using type = void; };
+
+template <class T, class = void> struct has_aw_awaitable_tag : std::false_type {};
+template <class T>
+struct has_aw_awaitable_tag<T, typename make_void<typename T::aw_awaitable_tag>::type>
+    : std::true_type {};
+
+template <class T, class = void> struct has_aw_this_coro_tag : std::false_type {};
+template <class T>
+struct has_aw_this_coro_tag<T, typename make_void<typename T::aw_this_coro_tag>::type>
+    : std::true_type {};
+
+template <class T, class Executor> struct is_awaitable_of : std::false_type {};
+template <class U, class Executor>
+struct is_awaitable_of<awaitable<U, Executor>, Executor> : std::true_type {};
+
+template <class Executor> class awaitable_frame_base {
+  public:
+    using executor_type = Executor;
+
+    awaitable_frame_base() noexcept = default;
+    awaitable_frame_base(awaitable_frame_base const&) = delete;
+    awaitable_frame_base& operator=(awaitable_frame_base const&) = delete;
+
+    // §9.4：core 的 FrameMemory 优先用 promise 的 operator new(size_t)。
+    static void* operator new(std::size_t size) {
+        return recycling_allocate(mem_tag::awaitable_frame, size);
+    }
+    static void operator delete(void* pointer, std::size_t size) noexcept {
+        recycling_deallocate(mem_tag::awaitable_frame, pointer, size);
+    }
+
+    co2::suspend_always initial_suspend() const noexcept { return {}; }
+
+    struct final_awaiter {
+        awaitable_frame_base* self;
+        bool await_ready() const noexcept { return false; }
+        void await_suspend(co2::coroutine_handle<>) noexcept { self->pop_frame(); }
+        void await_resume() const noexcept {}
+    };
+    final_awaiter final_suspend() noexcept { return final_awaiter{this}; }
+
+    void unhandled_exception() noexcept { pending_exception_ = std::current_exception(); }
+
+    void rethrow_exception() {
+        if (pending_exception_) {
+            std::exception_ptr e = std::move(pending_exception_);
+            pending_exception_ = nullptr;
+            std::rethrow_exception(e);
+        }
+    }
+
+    // asio impl/awaitable.hpp:480-495。
+    void push_frame(awaitable_frame_base* caller) noexcept {
+        caller_ = caller;
+        attached_thread_ = caller_->attached_thread_;
+        attached_thread_->entry_point()->top_of_stack_ = this;
+        caller_->attached_thread_ = nullptr;
+    }
+
+    void pop_frame() noexcept {
+        if (caller_ != nullptr) caller_->attached_thread_ = attached_thread_;
+        attached_thread_->entry_point()->top_of_stack_ = caller_;
+        attached_thread_ = nullptr;
+        caller_ = nullptr;
+    }
+
+    void attach_thread(awaitable_thread<Executor>* thread) noexcept { attached_thread_ = thread; }
+
+    awaitable_thread<Executor>* detach_thread() noexcept {
+        awaitable_thread<Executor>* const thread = attached_thread_;
+        attached_thread_ = nullptr;
+        return thread;
+    }
+
+    void resume() {
+        resume_context context;
+        resume_context_ = &context;
+        coro_.resume();
+        // 帧可能已在别的线程上继续运行：此后只读栈上的 context。
+        if (context.after_suspend_fn != nullptr) context.after_suspend_fn(context.after_suspend_arg);
+    }
+
+    void after_suspend(void (*fn)(void*), void* arg) noexcept {
+        resume_context_->after_suspend_fn = fn;
+        resume_context_->after_suspend_arg = arg;
+    }
+
+    entry_frame_base<Executor>* entry() const noexcept { return attached_thread_->entry_point(); }
+
+    void clear_cancellation_slot() { entry()->cancellation_state_.slot().clear(); }
+
+    void destroy() noexcept { coro_.destroy(); }
+
+    // ---- §4.3 await_transform ----
+
+    template <class U>
+    awaitable<U, Executor> await_transform(awaitable<U, Executor>&& child) const {
+        throw_if_cancelled_now();
+        return std::move(child);
+    }
+
+    template <class Op, typename std::enable_if<
+                            has_aw_awaitable_tag<typename std::decay<Op>::type>::value, int>::type = 0>
+    Op&& await_transform(Op&& op) const {
+        throw_if_cancelled_now();
+        return std::forward<Op>(op);
+    }
+
+    struct executor_awaiter {
+        Executor ex;
+        bool await_ready() const noexcept { return true; }
+        void await_suspend(co2::coroutine_handle<>) const noexcept {}
+        Executor await_resume() const noexcept { return ex; }
+    };
+    executor_awaiter await_transform(this_coro::executor_t) const noexcept {
+        return executor_awaiter{entry()->executor_};
+    }
+
+    template <class Other,
+              typename std::enable_if<
+                  !is_awaitable_of<typename std::decay<Other>::type, Executor>::value &&
+                      !has_aw_awaitable_tag<typename std::decay<Other>::type>::value &&
+                      !has_aw_this_coro_tag<typename std::decay<Other>::type>::value,
+                  int>::type = 0>
+    co2::suspend_never await_transform(Other&&) const {
+        static_assert(dependent_false<Other>::value,
+                      "an aw::awaitable frame can only await aw::awaitable (same executor), "
+                      "use_awaitable operations, this_coro queries and async_generator::next()");
+        return {};
+    }
+
+    void throw_if_cancelled_now() const {
+        entry_frame_base<Executor>* const e = entry();
+        if (e->throw_if_cancelled_ && !!e->cancellation_state_.cancelled())
+            throw std::system_error{std::error_code{error::operation_aborted}, "co_await"};
+    }
+
+    // ---- 数据成员（asio :523-528）----
+    co2::coroutine_handle<> coro_{};
+    awaitable_thread<Executor>* attached_thread_{nullptr};
+    awaitable_frame_base* caller_{nullptr};
+    std::exception_ptr pending_exception_{};
+    resume_context* resume_context_{nullptr};
+};
+
+template <class T> struct frame_result {
+    aw::optional<T> value;
+    template <class U> void set(U&& u) { value.emplace(std::forward<U>(u)); }
+    T take() { return std::move(*value); }
+};
+template <class T> struct frame_result<T&> {
+    T* value{nullptr};
+    void set(T& u) noexcept { value = &u; }
+    T& take() noexcept { return *value; }
+};
+
+template <class T, class Executor> class awaitable_frame : public awaitable_frame_base<Executor> {
+  public:
+    awaitable<T, Executor> get_return_object() noexcept;
+
+    template <class U> void return_value(U&& v) { result_.set(std::forward<U>(v)); }
+
+    T get() {
+        this->caller_ = nullptr;
+        this->rethrow_exception();
+        return result_.take();
+    }
+
+  private:
+    frame_result<T> result_;
+};
+
+template <class Executor>
+class awaitable_frame<void, Executor> : public awaitable_frame_base<Executor> {
+  public:
+    awaitable<void, Executor> get_return_object() noexcept;
+
+    void return_void() noexcept {}
+
+    void get() {
+        this->caller_ = nullptr;
+        this->rethrow_exception();
+    }
+};
+
+} // namespace detail
+} // namespace aw
