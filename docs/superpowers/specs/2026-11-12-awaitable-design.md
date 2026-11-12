@@ -639,6 +639,102 @@ constexpr use_awaitable_t<> use_awaitable{};
 
 如果 `T` 不可默认构造，异常路径无法给出一个“值”。这时 `co_spawn` 的完成签名改用 `aw::optional<T>`（C++17 及以上就是 `std::optional`）。
 
+### 8.5 两条数据流的时序图
+
+#### ① 等待子协程：`CO2_AWAIT_SET(v, child(...))`
+
+规则依据：§4.2、§4.3 第 1 条、§4.4、§7.1、§9.2。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant P as 父帧（awaitable_frame）
+    participant C as 子帧（awaitable_frame）
+    participant T as awaitable_thread（pump）
+    participant E as 入口帧（executor / cancellation_state）
+    participant R as 回收缓存（awaitable_frame 标签）
+
+    Note over P: CO2_AWAIT_SET(v, child(...))<br/>调用 child(...) 时已从 R 取块创建子帧（initial_suspend = suspend_always）
+    P->>P: await_transform(awaitable)：throw_if_cancelled 且 cancelled() != none 时抛 operation_aborted
+    P->>C: awaitable::await_suspend(h) → C.push_frame(P)
+    C->>E: top_of_stack_ = C
+    Note over C,E: C.attached_thread_ = P.attached_thread_，P.attached_thread_ = nullptr<br/>executor 与取消状态都在入口帧里，子帧经执行线程共享（继承）
+    C-->>P: await_suspend 返回 void
+    P-->>T: 父帧 resume() 返回（没有登记 after_suspend）
+    T->>E: 读 top_of_stack_（= C，非空）
+    T->>C: C.resume()
+    Note over C: 执行协程体
+    alt CO2_RETURN(x)
+        C->>C: return_value(x) 写入结果存储
+    else 体内抛出
+        C->>C: unhandled_exception()：pending_exception_ = current_exception()
+    end
+    C->>C: final_suspend 的 awaiter：await_suspend → pop_frame()
+    C->>E: top_of_stack_ = P
+    Note over C,P: P.attached_thread_ = C.attached_thread_，C.caller_ = nullptr
+    C-->>T: C.resume() 返回
+    T->>E: 读 top_of_stack_（= P）
+    T->>P: P.resume()
+    P->>C: awaitable::await_resume() → C.get()
+    alt 有 pending_exception_
+        C-->>P: rethrow → 进入父帧的 unhandled_exception，继续向上传播
+    else
+        C-->>P: 移出结果 → v
+    end
+    P->>C: 父帧 awaiter 槽里的 awaitable 析构 → 销毁子帧
+    C->>R: operator delete(size)：库线程上放回缓存（满了或非库线程则 delete）
+```
+
+#### ② 等待异步操作：`CO2_AWAIT_SET(n, op(args, aw::use_awaitable))`
+
+规则依据：§4.3 第 2 条、§6.2 第 2 条、§7.3 第 2 条、§8.3、§8.4。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant F as 栈顶帧（awaitable_frame）
+    participant A as async_op_awaiter（帧的 awaiter 槽）
+    participant T as awaitable_thread（pump）
+    participant H as 完成回调 handler（持有执行线程）
+    participant O as 异步操作（initiation）
+    participant X as 执行线程的 executor（可为 strand）
+
+    Note over F: CO2_AWAIT_SET(n, op(args, aw::use_awaitable))<br/>async_result 返回 A（init 与 args 的 decay 副本）
+    F->>F: await_transform：throw_if_cancelled 且已取消时抛 operation_aborted
+    F->>A: await_suspend(h)
+    A->>F: after_suspend(&on_suspend, A)（写入栈上的 resume_context）
+    A-->>F: 返回 void
+    F-->>T: 帧的 resume() 内 coro_.resume() 返回
+    T->>A: resume() 收尾执行 after_suspend：on_suspend(A)
+    A->>H: handler h{frame->detach_thread(), &result_}（move 执行线程进 h）
+    Note over H: h 的关联 executor = X<br/>关联 slot = 入口帧 cancellation_state.slot()
+    A->>O: init(std::move(h), args...)
+    O->>O: 在关联 slot 上安装取消处理器
+    T->>T: 栈底已被移走 → pump 退出
+    Note over O: 稍后操作完成（可能在别的 OS 线程）
+    O->>O: 清掉 slot 上的取消处理器
+    alt X.running_in_this_thread()
+        O->>H: 内联调用 h(ec, n)
+    else
+        O->>X: aw::dispatch(X, …)：排入 X（strand 时经 strand 串行化）
+        X->>H: 在 X 上调用 h(ec, n)
+    end
+    H->>A: result_ = 参数的地址（零拷贝，参数在 h 的栈上）
+    H->>T: attach_thread → clear_cancellation_slot → pump()（在 h 的栈内）
+    T->>F: 栈顶 F.resume()
+    F->>A: await_resume()
+    alt use_awaitable 且 ec 非零
+        A-->>F: 抛 std::system_error(ec)
+    else as_tuple(use_awaitable)
+        A-->>F: 返回 std::tuple(ec, n)（不抛）
+    else redirect_error(use_awaitable, ec_local)
+        A-->>F: 把 ec 写进 ec_local，返回 n（不抛）
+    else 成功
+        A-->>F: 从指针移出 n
+    end
+    Note over O,H: 同步完成（init 调用栈内直接调用 h）：h 不内联 pump，<br/>参数移进 A 自己的存储后 post 到 X（§8.3）
+```
+
 ## 9. 帧与分配
 
 ### 9.1 帧布局
@@ -943,5 +1039,6 @@ asio 版本是 `190a8d8`。
      - §6.2 第 1 条原写“挂在 token 的 slot 上”，与 §8.2 的“内部 signal”矛盾，已统一。
      - §6.4 补上 `EnvStopToken` 的来源，以及 `getStopToken` / `inheritStopToken` 的移植与兼容名。
      - §3.1 补上夹具的 include 改写规则；§3.2 更正了 `move_only_function` 的用途。
+     - 补上约定的两张时序图（§8.5：① 等待子协程，② 等待 use_awaitable 异步操作）。类型名和规则与 §4–§8 一致：`push_frame` / `pop_frame` 是帧的成员；executor 和取消状态放在入口帧里，由执行线程共享；同步完成时走 post 分支。两张图都用 mermaid 11 的解析器（`mermaid.parse`，在 jsdom 下运行）校验通过。
 3. **范围：** 只覆盖一个库的 v1；core 的搬运作为实现计划的第一步。没有引入批准范围之外的功能：`deferred`、默认 token、捕获包装都被明确排除。
 4. **歧义消除：** “热路径”“库线程”在 §0 定义；“1.2 倍”指同一项的中位耗时；“分配次数不多于 asio”逐项比较；“core 原样”的可检查形式见 §15.4 第 5 条。
