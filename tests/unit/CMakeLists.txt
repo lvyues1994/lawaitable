@@ -1,2 +1,4 @@
 aw_unit_test(optional_variant_test)
 aw_unit_test(error_test)
+aw_unit_test(recycling_allocator_test)
+aw_unit_test(recycling_disabled_test)
