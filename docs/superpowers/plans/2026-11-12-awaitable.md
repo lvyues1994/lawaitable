@@ -147,6 +147,7 @@
 - 异线程完成（`bridge_cross_thread`）不可能零分配：完成发生在非库线程，回收缓存按设计不在那里工作，asio 在这一项同样是 1 次。2026-11-13 经用户决定，规格 §15.4 第 4 条已豁免这一项（依据 D12），`tools/check-acceptance.py` 对它只打印 `EXEMPT`，不计失败；它仍受第 2、3 条约束（Task 20）。
 - asio 没有 async_generator，`generator_yield_1000` 只和 coro / 缓存关比较（Task 20）。
 - 验收修订第 2 项（2026-11-13，用户决定）：`||` / `&&` 的两个子执行线程入口帧并进组状态那一块，子执行线程的父 slot 直接用组状态的 signal，不再经 `co_spawn`。Task 10、13、14 里的代码块是修订前的版本，修订作为文末“验收修订第 2 项”叠加在 Task 20 之后。
+- 跨线程投递路径修订（2026-11-13，用户决定）：单 CPU 的工作线程跳过停车前的 pause 自旋，Task 5 的 thread_pool 代码块是修订前的版本，修订见文末“验收修订：跨线程投递路径”。
 - 执行期修正（2026-11-13，用户同意）：Task 18 场景 6（affinity）的 asio 侧原先在 asio 池线程上 `std::vector<std::thread>::emplace_back` 启动外部线程，主线程在 `future.get()` 返回后遍历该 vector 并 join，二者存在数据竞争（TSan 下约 15% 失败，偶发 terminate）。现改为与 aw 侧相同的 `aw_test::foreign_threads`（加锁登记、析构时 join），并让它在 asio 线程池之前析构。只改测试，不改库。
 
 ---
@@ -11680,4 +11681,36 @@ git commit -m "bench: multi-run stats tool for a single benchmark item"
 ```bash
 git add include tests/unit/operators_test.cpp benchmarks/results docs
 git commit -m "operators: embed child entry frames in the group state (or/and 9 -> 2 allocations/op)"
+```
+
+---
+
+### 验收修订：跨线程投递路径（2026-11-13，用户决定）
+
+**目标：** 在验收测法下（单核绑定），`bridge_cross_thread` 的耗时不超过 asio 的 1.2 倍，双核不明显退化。只改 thread_pool 及相关代码，不改 core，不改缓存默认值。
+
+**归因：** 自建微基准，用 steady_clock 分三段打点，再读每个线程的上下文切换次数，strace 作参考。结论是单核下差距全在“发起 → 完成线程开始”这一段：池线程停车前的 pause 自旋（约 11.6 µs 上限）占住唯一的核，推迟了被唤醒的完成线程。数据见 `benchmarks/results/2026-11-13-cross-thread-spin.md`。
+
+**Files:**
+- Modify: `include/awaitable/exec/thread_pool.hpp`：
+  - 新增 `detail::cpus_available_to_this_thread()`：Linux 上用 `sched_getaffinity` 计数，其他平台用 `hardware_concurrency`，至少为 1。
+  - 新增 `detail::pause_spin_useful(cpus)`，即 `cpus > 1`。
+  - `Worker::firstRound` 在 `workerMain` 开头设定：单 CPU 时为 `spinRounds`，否则为 0。
+  - `search()` 从 `max(searchStart, firstRound)` 开始。
+- Test: `tests/unit/thread_pool_test.cpp` 加 `spinFollowsAvailableCpus`，检查四件事：
+  - `pause_spin_useful(1/2)` 的返回值；
+  - `cpus_available_to_this_thread()` 与 `CPU_COUNT(sched_getaffinity)` 相等；
+  - 把本线程绑到一个 CPU 后返回 1；
+  - 之后新建的线程池工作线程上看到的也是 1。
+
+**步骤与结果：**
+1. 先写测试：两个函数还不存在，编译失败。
+2. 实现后测试通过。
+3. 12 个配置全套通过（54/54）。thread_pool、thread_pool 异常契约、strand、use_awaitable、sync_wait、sync_wait 契约和 stress 共 7 项，在 tsan-cxx14/17/20 各加跑 50 轮，0 失败。core 校验输出 `VERBATIM OK`。
+4. `tools/bench-item-stats.py bridge_cross_thread 30 2`：aw/asio 中位数从 1.45 降到 0.99；`… 30 2,3`：0.69 → 0.70。
+5. 重跑 `tools/run-benchmarks.sh`，其他项没有回退。`check-acceptance.py` 只剩 `await_child` 耗时一项失败。
+
+```bash
+git add include/awaitable/exec/thread_pool.hpp tests/unit/thread_pool_test.cpp benchmarks/results docs
+git commit -m "thread_pool: skip pause spinning when the worker has a single CPU (bridge_cross_thread 1.45x -> 0.99x)"
 ```

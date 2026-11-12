@@ -20,6 +20,9 @@
 #if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
 #include <intrin.h>
 #endif
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 // aw 执行层：工作窃取线程池（移植自 coro 0be5ab2 的 co2::ThreadPool，规格 §5.4）。
 // 移植改动：队列项带标记（§5.3）；get_executor / running_in_this_thread / post；每个工作线程
@@ -198,6 +201,25 @@ inline void cpuRelax() noexcept {
 #endif
 }
 
+// 调用线程可以运行在几个 CPU 上：Linux 读本线程的亲和性掩码（taskset、cpuset），其他平台
+// 或读取失败时退回 hardware_concurrency。至少为 1。
+inline unsigned cpus_available_to_this_thread() noexcept {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        int const count = CPU_COUNT(&set);
+        if (count > 0) return static_cast<unsigned>(count);
+    }
+#endif
+    unsigned const detected = std::thread::hardware_concurrency();
+    return detected == 0U ? 1U : detected;
+}
+
+// 停车前的 pause 自旋只在别的线程能同时运行时有意义：只有 1 个 CPU 时，提交方（外部完成
+// 线程）要等本线程让出这个核才能跑，自旋只是白白推迟它（验收修订：跨线程项）。
+constexpr bool pause_spin_useful(unsigned const cpus) noexcept { return cpus > 1U; }
+
 } // namespace detail
 
 class thread_pool final : public scheduler {
@@ -286,6 +308,9 @@ class thread_pool final : public scheduler {
         bool searching{};
         // 下一次搜索从第几轮开始，见 search()。
         unsigned searchStart{};
+        // 搜索至少从第几轮开始：本线程只能用 1 个 CPU 时跳过 pause 自旋，直接从让出轮开始。
+        // 工作线程启动时按自己的亲和性定下（线程继承创建者的亲和性）。
+        unsigned firstRound{};
         // 上一次看到某个受害者"只剩一项"时它的队首位置，见 steal()。
         std::vector<std::int64_t> seenHead;
         std::thread thread;
@@ -309,6 +334,8 @@ class thread_pool final : public scheduler {
     void workerMain(Worker& worker) noexcept {
         detail::thread_context context;
         currentWorkerSlot() = &worker;
+        worker.firstRound =
+            detail::pause_spin_useful(detail::cpus_available_to_this_thread()) ? 0U : unsigned{spinRounds};
         for (;;) {
             if (auto* const item = findWork(worker)) {
                 worker.searchStart = 0U;
@@ -347,7 +374,8 @@ class thread_pool final : public scheduler {
             worker.searching = true;
             counters.searching.fetch_add(1U, std::memory_order_seq_cst);
         }
-        for (auto round = worker.searchStart; round != spinRounds + yieldRounds; ++round) {
+        auto const first = worker.searchStart > worker.firstRound ? worker.searchStart : worker.firstRound;
+        for (auto round = first; round < spinRounds + yieldRounds; ++round) {
             if (auto* const item = steal(worker)) return item;
             if (auto* const item = popGlobal()) return item;
             if (stopping.load(std::memory_order_relaxed)) break;

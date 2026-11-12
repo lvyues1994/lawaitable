@@ -370,6 +370,7 @@ inline schedule_on_awaiter schedule_on(scheduler& s) noexcept;   // 原 schedule
    1. 停止接收新任务，唤醒并 join 全部工作线程。
    2. 排空所有队列：`operation` 以 `invoke=false` 销毁；销毁过程中新投递的项同样立即销毁。
    3. 队列里如果还有协程句柄项，属于契约违规（沿用 coro `ManualExecutor` 的销毁契约）。
+6. **自旋感知核数（2026-11-13 验收修订）：** 工作线程启动时用 `detail::cpus_available_to_this_thread()` 读取自己的 CPU 亲和性（Linux 上是 `sched_getaffinity`，其他平台退回 `hardware_concurrency`）。只有 1 个 CPU 时（`detail::pause_spin_useful` 为假），停车前的搜索跳过 pause 自旋，直接进入让出时间片的轮次：单核上提交方要等本线程让出这个核才能运行，自旋只会推迟它。有多个 CPU 时行为不变。线程启动后亲和性再变化不会重新读取。
 
 ### 5.5 `manual_executor`（保留，修改）
 
@@ -1047,4 +1048,5 @@ asio 版本是 `190a8d8`。
 4. **验收修订（2026-11-13）：**
    - 第 1 项：按用户决定，§15.4 第 4 条豁免 `bridge_cross_thread`（非库线程完成，依据 D12，asio 同为 1 次）；`tools/check-acceptance.py` 同步把该项改为 EXEMPT。
    - 第 2 项：`||` / `&&` 的子执行线程入口帧并进组状态，子执行线程的父 slot 直接用组状态的 signal，去掉 co_spawn 取消桥和入口帧内部 signal 上那次多余的状态安装（§6.2 第 1 条、§6.3、§9.3）。稳态每次运算的全局 `operator new` 从 9 次降到 2 次（asio 5 次）。剩下的 2 次来自同标签 3 块同时存活而缓存只有 2 格：运算符协程帧与两个操作数帧，转发处理器与两个子取消状态。要降到 0，需要改缓存格数或设计，所以没有做（benchmarks/results/2026-11-13-operators-merge.md）。组状态大于 1020 B（操作数值类型很大时）就不进缓存，每次运算多 1 次分配。
+   - 跨线程项：按用户决定优化投递路径（§5.4 第 6 条）。归因结果：单核下差距全在“池线程 submit 后到完成线程开始运行”这一段，原因是池线程停车前的 pause 自旋占住唯一的核。修订后单核下 aw/asio 中位数从 1.45 降到 0.99，双核不变（0.69 → 0.70），见 benchmarks/results/2026-11-13-cross-thread-spin.md。§15.4 第 3 条对这一项已满足。
 5. **歧义消除：** “热路径”“库线程”在 §0 定义；“1.2 倍”指同一项的中位耗时；“分配次数不多于 asio”逐项比较；“core 原样”的可检查形式见 §15.4 第 5 条。

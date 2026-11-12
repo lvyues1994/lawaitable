@@ -5,6 +5,10 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
 #include "awaitable/exec/thread_pool.hpp"
 #include "check.hpp"
 #include "counting_new.hpp"
@@ -117,6 +121,40 @@ void workerChainsReuseOperationMemory() {
     if (aw_test::counting_new_enabled) AW_CHECK(news == 0);
 }
 
+// 验收修订（跨线程项）：工作线程按本线程可用的 CPU 数决定停车前要不要 pause 自旋。
+// 只有 1 个 CPU 时自旋只会占住提交方要用的那个核，直接进入让出时间片的轮次。
+void spinFollowsAvailableCpus() {
+    AW_CHECK(!aw::detail::pause_spin_useful(1U));
+    AW_CHECK(aw::detail::pause_spin_useful(2U));
+    AW_CHECK(aw::detail::cpus_available_to_this_thread() >= 1U);
+#if defined(__linux__)
+    cpu_set_t original;
+    CPU_ZERO(&original);
+    AW_CHECK(sched_getaffinity(0, sizeof original, &original) == 0);
+    AW_CHECK(aw::detail::cpus_available_to_this_thread() == static_cast<unsigned>(CPU_COUNT(&original)));
+    int first = 0;
+    while (!CPU_ISSET(first, &original)) ++first;
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(first, &one);
+    AW_CHECK(sched_setaffinity(0, sizeof one, &one) == 0);
+    AW_CHECK(aw::detail::cpus_available_to_this_thread() == 1U);
+    {
+        // 工作线程继承创建者的亲和性，在工作线程上看到的也是 1。
+        aw::thread_pool pool{1U};
+        latch done{1};
+        std::atomic<unsigned> seen{0U};
+        pool.get_executor().post([&] {
+            seen = aw::detail::cpus_available_to_this_thread();
+            done.count_down();
+        });
+        done.wait();
+        AW_CHECK(seen.load() == 1U);
+    }
+    AW_CHECK(sched_setaffinity(0, sizeof original, &original) == 0);
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -125,6 +163,7 @@ int main() {
     scheduleResumesOnAWorker();
     queuedWorkIsRunOrDestroyedOnShutdown();
     workerChainsReuseOperationMemory();
+    spinFollowsAvailableCpus();
     AW_CHECK(aw::thread_pool::default_thread_count() >= 1U);
     return 0;
 }
