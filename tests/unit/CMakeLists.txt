@@ -19,3 +19,21 @@ aw_unit_test(operators_test)
 aw_unit_test(async_generator_test)
 aw_contract_test(async_generator_two_next_contract_test)
 aw_contract_test(async_generator_destroy_active_contract_test)
+aw_unit_test(sync_wait_test)
+aw_contract_test(sync_wait_on_own_thread_contract_test)
+
+# §2.2：每个公共头都能单独包含（每个头生成一个只包含它两次的 TU）。
+file(GLOB_RECURSE AW_PUBLIC_HEADERS RELATIVE ${PROJECT_SOURCE_DIR}/include CONFIGURE_DEPENDS
+     ${PROJECT_SOURCE_DIR}/include/*.hpp)
+set(AW_SELF_CONTAINED_SOURCES)
+foreach(header IN LISTS AW_PUBLIC_HEADERS)
+    string(MAKE_C_IDENTIFIER "${header}" stem)
+    set(source ${CMAKE_CURRENT_BINARY_DIR}/self_contained/${stem}.cpp)
+    file(CONFIGURE OUTPUT ${source} CONTENT "#include \"${header}\"\n#include \"${header}\"\n")
+    list(APPEND AW_SELF_CONTAINED_SOURCES ${source})
+endforeach()
+add_library(aw-header-self-containment OBJECT ${AW_SELF_CONTAINED_SOURCES})
+aw_configure_test(aw-header-self-containment)
+add_test(NAME aw-header-self-containment
+         COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target aw-header-self-containment)
+set_tests_properties(aw-header-self-containment PROPERTIES RESOURCE_LOCK aw-build-tree)
