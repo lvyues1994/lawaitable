@@ -1,0 +1,10 @@
+# §14.6：并发压测。每项的轮数：Release 30，其余（Debug / ASan / TSan）10。
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(AW_STRESS_ROUNDS 30)
+else()
+    set(AW_STRESS_ROUNDS 10)
+endif()
+add_executable(aw-stress-test stress_test.cpp)
+aw_configure_test(aw-stress-test)
+add_test(NAME aw-stress-test COMMAND aw-stress-test ${AW_STRESS_ROUNDS})
+set_tests_properties(aw-stress-test PROPERTIES TIMEOUT 600)
