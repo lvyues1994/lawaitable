@@ -4,7 +4,8 @@
 - 第 2 条：每一项 aw（缓存开）的分配次数不多于 asio 的同一项（asio 没有的项记 n/a，不计失败）。
 - 第 3 条：await_child、await_child_nested_1000、bridge_same_thread、bridge_cross_thread 的中位耗时不超过 asio 的 1.2 倍。
 - 第 4 条：热路径（§0）在缓存打开时每次 0 次全局 operator new：await_child、bridge_same_thread、
-  bridge_cross_thread、co_spawn、strand_post、generator_yield_1000。
+  co_spawn、strand_post、generator_yield_1000。bridge_cross_thread 的完成发生在非库线程上，回收缓存按 D12
+  不在那里生效（asio 同为 1 次），按 §15.4 第 4 条豁免：只打印 EXEMPT，不计失败；它仍受第 2、3 条约束。
 全部通过时退出码 0，否则 1。
 """
 import glob, json, os, sys
@@ -25,7 +26,9 @@ for item in sorted(aw):
 for item in ["await_child", "await_child_nested_1000", "bridge_same_thread", "bridge_cross_thread"]:
     ratio = aw[item]["ns"] / asio[item]["ns"]
     report(ratio <= 1.2, "time %s: aw/asio = %.2f (<= 1.20)" % (item, ratio))
-for item in ["await_child", "bridge_same_thread", "bridge_cross_thread", "co_spawn", "strand_post", "generator_yield_1000"]:
+for item in ["await_child", "bridge_same_thread", "co_spawn", "strand_post", "generator_yield_1000"]:
     report(aw[item]["news"] == 0, "zero-allocation %s: %.3g new/op" % (item, aw[item]["news"]))
+print("EXEMPT zero-allocation bridge_cross_thread: aw %.3g new/op, asio %.3g new/op (completion on a non-library thread, D12)"
+      % (aw["bridge_cross_thread"]["news"], asio["bridge_cross_thread"]["news"]))
 print("ACCEPTANCE %s (%d failure(s)) — %s" % ("OK" if failures == 0 else "FAILED", failures, os.path.relpath(path)))
 sys.exit(0 if failures == 0 else 1)

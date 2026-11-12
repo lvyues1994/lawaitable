@@ -144,7 +144,7 @@
 - `post.hpp` / `dispatch.hpp` 放在 `include/awaitable/` 顶层，而不是规格写的 `exec/` 下（Task 9）。
 - 规格列出的 `impl/handlers.hpp` 没有单独建：handler 放在 `impl/async_op_awaiter.hpp`（Task 11）和 `impl/entry_point.hpp`（Task 10 / 13）里。
 - `async_generator` 的左值 yield 是拷贝出去的，右值才移动（Task 15）。
-- 异线程完成（`bridge_cross_thread`）不可能零分配：完成发生在非库线程，回收缓存按设计不在那里工作，asio 在这一项同样是 1 次。§15.4 第 4 条对这一项无法满足（Task 20）。
+- 异线程完成（`bridge_cross_thread`）不可能零分配：完成发生在非库线程，回收缓存按设计不在那里工作，asio 在这一项同样是 1 次。2026-11-13 经用户决定，规格 §15.4 第 4 条已豁免这一项（依据 D12），`tools/check-acceptance.py` 对它只打印 `EXEMPT`，不计失败；它仍受第 2、3 条约束（Task 20）。
 - asio 没有 async_generator，`generator_yield_1000` 只和 coro / 缓存关比较（Task 20）。
 - 执行期修正（2026-11-13，用户同意）：Task 18 场景 6（affinity）的 asio 侧原先在 asio 池线程上 `std::vector<std::thread>::emplace_back` 启动外部线程，主线程在 `future.get()` 返回后遍历该 vector 并 join，二者存在数据竞争（TSan 下约 15% 失败，偶发 terminate）。现改为与 aw 侧相同的 `aw_test::foreign_threads`（加锁登记、析构时 join），并让它在 asio 线程池之前析构。只改测试，不改库。
 
@@ -11516,7 +11516,8 @@ PY
 - 第 2 条：每一项 aw（缓存开）的分配次数不多于 asio 的同一项（asio 没有的项记 n/a，不计失败）。
 - 第 3 条：await_child、await_child_nested_1000、bridge_same_thread、bridge_cross_thread 的中位耗时不超过 asio 的 1.2 倍。
 - 第 4 条：热路径（§0）在缓存打开时每次 0 次全局 operator new：await_child、bridge_same_thread、
-  bridge_cross_thread、co_spawn、strand_post、generator_yield_1000。
+  co_spawn、strand_post、generator_yield_1000。bridge_cross_thread 的完成发生在非库线程上，回收缓存按 D12
+  不在那里生效（asio 同为 1 次），按 §15.4 第 4 条豁免：只打印 EXEMPT，不计失败；它仍受第 2、3 条约束。
 全部通过时退出码 0，否则 1。
 """
 import glob, json, os, sys
@@ -11537,8 +11538,10 @@ for item in sorted(aw):
 for item in ["await_child", "await_child_nested_1000", "bridge_same_thread", "bridge_cross_thread"]:
     ratio = aw[item]["ns"] / asio[item]["ns"]
     report(ratio <= 1.2, "time %s: aw/asio = %.2f (<= 1.20)" % (item, ratio))
-for item in ["await_child", "bridge_same_thread", "bridge_cross_thread", "co_spawn", "strand_post", "generator_yield_1000"]:
+for item in ["await_child", "bridge_same_thread", "co_spawn", "strand_post", "generator_yield_1000"]:
     report(aw[item]["news"] == 0, "zero-allocation %s: %.3g new/op" % (item, aw[item]["news"]))
+print("EXEMPT zero-allocation bridge_cross_thread: aw %.3g new/op, asio %.3g new/op (completion on a non-library thread, D12)"
+      % (aw["bridge_cross_thread"]["news"], asio["bridge_cross_thread"]["news"]))
 print("ACCEPTANCE %s (%d failure(s)) — %s" % ("OK" if failures == 0 else "FAILED", failures, os.path.relpath(path)))
 sys.exit(0 if failures == 0 else 1)
 ```
@@ -11558,15 +11561,15 @@ Expected：
 
 Run: `rm -f benchmarks/results/$(date +%F).*; tools/run-benchmarks.sh && tools/check-acceptance.py; echo "exit=$?"`
 Expected：
-- 输出 20 行 `PASS` / `FAIL` / `n/a`，最后是 `ACCEPTANCE ...` 一行；
+- 输出 20 行 `PASS` / `FAIL` / `n/a` / `EXEMPT`，最后是 `ACCEPTANCE ...` 一行；
 - `benchmarks/results/<日期>.md` 里有一张 10 行的对照表，以及一行帧大小探针。
 
-写计划时，在 stage 原型上实测（clang 22.1.8，Xeon，5 次取中位数）的结果是 `ACCEPTANCE FAILED (5 failure(s))`。失败的五项：
+写计划时，在 stage 原型上实测（clang 22.1.8，Xeon，5 次取中位数）的结果是 `ACCEPTANCE FAILED (5 failure(s))`；按 2026-11-13 修订后的 §15.4 第 4 条，最后一项改为 `EXEMPT`，即 `ACCEPTANCE FAILED (4 failure(s))`。当时失败的五项：
 - `allocations or_ready`：aw 9 次，asio 5 次；
 - `allocations and_ready`：aw 9 次，asio 5 次；
 - `time await_child`：aw/asio = 1.36；
 - `time bridge_cross_thread`：aw/asio = 1.38；
-- `zero-allocation bridge_cross_thread`：1 new/op。完成发生在非库线程上，回收缓存按设计不在那里工作，asio 在这一项同样是 1 次。
+- `zero-allocation bridge_cross_thread`：1 new/op。完成发生在非库线程上，回收缓存按设计不在那里工作，asio 在这一项同样是 1 次。修订后为 `EXEMPT zero-allocation bridge_cross_thread: aw 1 new/op, asio 1 new/op (completion on a non-library thread, D12)`。
 
 其余 15 项是 `PASS` 或 `n/a`。
 
@@ -11583,3 +11586,62 @@ git commit -m "bench: aw vs asio vs coro vs native benchmarks, acceptance check 
 - 针对单项调优，例如 `||` / `&&` 的子协程入口帧和共享状态合并分配，或者 `await_child` 的快路径；
 - 修订 §15.4 的验收条款，例如把异线程完成从零分配要求中豁免；
 - 接受现状。
+
+- [ ] **Step 6（2026-11-13 补充）：单项多轮测量工具**
+
+用户决定对 `bridge_cross_thread` 做多轮测量后再判断。工具只读 `build/bench` 里已构建的基准，不改库。
+
+`tools/bench-item-stats.py`：
+
+```python
+#!/usr/bin/env python3
+"""对单个基准项做多轮测量：aw-bench 与 asio-bench 交替各跑 N 次（同一机器、taskset 绑核），
+输出两边耗时的中位数 / p10 / p90 和中位数比值。先运行 tools/run-benchmarks.sh 生成 build/bench。
+
+用法：tools/bench-item-stats.py <项> [次数=20] [cpu 列表=2]
+例：  tools/bench-item-stats.py bridge_cross_thread 30 2
+"""
+import os, re, statistics, subprocess, sys
+
+item = sys.argv[1]
+runs = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+cpus = sys.argv[3] if len(sys.argv) > 3 else "2"
+bench = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "bench", "benchmarks")
+pattern = re.compile(r"^bench %s ns=([0-9.]+) news=([0-9.]+)" % re.escape(item), re.M)
+
+def pct(xs, p):
+    xs = sorted(xs)
+    k = (len(xs) - 1) * p
+    lo = int(k)
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+samples = {"aw-bench": [], "asio-bench": []}
+news = {}
+for _ in range(runs):
+    for name in samples:  # 交替运行，减少机器状态漂移对单边的影响
+        out = subprocess.run(["taskset", "-c", cpus, os.path.join(bench, name)], check=True,
+                             capture_output=True, text=True).stdout
+        m = pattern.search(out)
+        if m is None:
+            sys.exit("%s: item %s not found" % (name, item))
+        samples[name].append(float(m.group(1)))
+        news[name] = float(m.group(2))
+
+print("item %s, %d runs each, taskset -c %s" % (item, runs, cpus))
+print("| | 中位数 ns | p10 ns | p90 ns | new/op |")
+print("| --- | --- | --- | --- | --- |")
+for name, xs in samples.items():
+    print("| %s | %.1f | %.1f | %.1f | %.3g |" % (name, statistics.median(xs), pct(xs, 0.1), pct(xs, 0.9), news[name]))
+aw, asio = samples["aw-bench"], samples["asio-bench"]
+print("ratio aw/asio: median %.2f, p10 %.2f, p90 %.2f" % (statistics.median(aw) / statistics.median(asio),
+                                                         pct(aw, 0.1) / pct(asio, 0.1), pct(aw, 0.9) / pct(asio, 0.9)))
+```
+
+Run: `chmod +x tools/bench-item-stats.py && tools/bench-item-stats.py bridge_cross_thread 30 2`
+Expected：一张两行（aw-bench / asio-bench）的表，列出中位数、p10、p90 和 new/op，最后一行是 `ratio aw/asio: median …, p10 …, p90 …`。
+
+```bash
+git add tools/bench-item-stats.py
+git commit -m "bench: multi-run stats tool for a single benchmark item"
+```
