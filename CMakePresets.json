@@ -1,0 +1,55 @@
+{
+    "version": 3,
+    "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": { "AW_TEST_CXX_STANDARD": "14" }
+        },
+        { "name": "debug", "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" } },
+        { "name": "release", "inherits": "base", "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" } },
+        {
+            "name": "asan",
+            "displayName": "ASan + UBSan",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -g"
+            }
+        },
+        {
+            "name": "tsan",
+            "inherits": "base",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "CMAKE_CXX_FLAGS": "-fsanitize=thread -fno-omit-frame-pointer -g"
+            }
+        },
+        { "name": "debug-cxx17", "inherits": "debug", "cacheVariables": { "AW_TEST_CXX_STANDARD": "17" } },
+        { "name": "debug-cxx20", "inherits": "debug", "cacheVariables": { "AW_TEST_CXX_STANDARD": "20" } }
+    ],
+    "buildPresets": [
+        { "name": "debug", "configurePreset": "debug" },
+        { "name": "release", "configurePreset": "release" },
+        { "name": "asan", "configurePreset": "asan" },
+        { "name": "tsan", "configurePreset": "tsan" },
+        { "name": "debug-cxx17", "configurePreset": "debug-cxx17" },
+        { "name": "debug-cxx20", "configurePreset": "debug-cxx20" }
+    ],
+    "testPresets": [
+        { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
+        { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+        {
+            "name": "asan",
+            "configurePreset": "asan",
+            "output": { "outputOnFailure": true },
+            "environment": { "ASAN_OPTIONS": "detect_leaks=0", "UBSAN_OPTIONS": "print_stacktrace=1" }
+        },
+        { "name": "tsan", "configurePreset": "tsan", "output": { "outputOnFailure": true } },
+        { "name": "debug-cxx17", "configurePreset": "debug-cxx17", "output": { "outputOnFailure": true } },
+        { "name": "debug-cxx20", "configurePreset": "debug-cxx20", "output": { "outputOnFailure": true } }
+    ]
+}

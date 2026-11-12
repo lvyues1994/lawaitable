@@ -1,0 +1,143 @@
+# 普通测试：可执行文件名与源文件名一一对应，成功即退出码 0。
+set(co2_test_sources
+    conformance_tests.cpp
+    storage_tests.cpp
+    return_types_tests.cpp
+    scheduler_tests.cpp
+    thread_pool_tests.cpp
+    stop_token_tests.cpp
+    spawn_tests.cpp
+    when_all_tests.cpp
+    callback_tests.cpp
+    allocation_tests.cpp
+    edge_case_tests.cpp)
+
+# 契约违规测试：程序在预期的失败点经由契约处理器以退出码 86 结束。
+set(co2_contract_violation_test_sources
+    task_destroy_contract_violation_test.cpp
+    manual_executor_contract_violation_test.cpp
+    join_handle_contract_violation_test.cpp
+    generator_begin_twice_contract_violation_test.cpp
+    resume_running_contract_violation_test.cpp
+    thread_pool_zero_threads_contract_violation_test.cpp
+    async_generator_destroy_contract_violation_test.cpp
+    continuation_twice_contract_violation_test.cpp)
+
+# 构建测试用的 C++ 标准。库的最低要求是 14，默认就测它；CI 另以 17 / 20 / 23 各跑一遍，
+# 保证较新的标准下（弃用告警、更严格的规则）同样干净。
+set(CO2_TEST_CXX_STANDARD 14 CACHE STRING "C++ standard used to build the co2 tests")
+
+function(co2_configure_test_target target)
+    target_link_libraries(${target} PRIVATE co2::co2)
+    set_target_properties(
+        ${target}
+        PROPERTIES
+            CXX_STANDARD ${CO2_TEST_CXX_STANDARD}
+            CXX_STANDARD_REQUIRED YES
+            CXX_EXTENSIONS NO)
+
+    if(MSVC)
+        # /permissive- 走标准一致模式（两阶段查找、替代记号等）。不加 /Zc:__cplusplus，
+        # 让 config.hpp 的 _MSVC_LANG 版本判断在 CI 里真正被测到。
+        # C4324：alignas 导致结构体填充——AwaitSlot / MoveOnlyFunction 的内联缓冲刻意如此。
+        # C4127：条件表达式为常量——C++14 没有 if constexpr，模板里依赖 T 的 if 必然如此。
+        target_compile_options(${target} PRIVATE /W4 /WX /permissive- /wd4324 /wd4127)
+    else()
+        target_compile_options(
+            ${target}
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+                -Werror
+                -Wconversion
+                -Wsign-conversion
+                -Wnon-virtual-dtor
+                -Wold-style-cast
+                -Wzero-as-null-pointer-constant
+                -Werror=return-type
+                -Werror=uninitialized
+                -Werror=suggest-override
+                -Werror=vla)
+    endif()
+endfunction()
+
+function(co2_test_target_name source out_var)
+    get_filename_component(stem "${source}" NAME_WE)
+    string(REPLACE "_" "-" stem "${stem}")
+    set(${out_var} "co2-${stem}" PARENT_SCOPE)
+endfunction()
+
+foreach(co2_test_source IN LISTS co2_test_sources)
+    co2_test_target_name("${co2_test_source}" co2_test_target)
+    add_executable(${co2_test_target} ${co2_test_source})
+    co2_configure_test_target(${co2_test_target})
+    add_test(NAME ${co2_test_target} COMMAND ${co2_test_target})
+endforeach()
+
+foreach(co2_test_source IN LISTS co2_contract_violation_test_sources)
+    co2_test_target_name("${co2_test_source}" co2_test_target)
+    add_executable(${co2_test_target} ${co2_test_source})
+    co2_configure_test_target(${co2_test_target})
+    add_test(NAME ${co2_test_target}
+             COMMAND ${CMAKE_COMMAND}
+                     -DTEST_EXECUTABLE=$<TARGET_FILE:${co2_test_target}>
+                     -DEXPECTED_EXIT_CODE=86
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/expect_exit_code.cmake)
+endforeach()
+
+# 编译失败测试：定义 CO2_EXPECT_COMPILE_FAILURE 时源文件必须编不过。同一份源文件不带该
+# 宏的对照目标随正常构建一起编译，证明失败只来自被测的那一处，而不是别的笔误。
+set(co2_compile_fail_test_sources
+    await_inside_switch_compile_fail_test.cpp
+    member_macro_outside_member_function_compile_fail_test.cpp
+    promise_operator_new_with_params_compile_fail_test.cpp
+    final_suspend_not_noexcept_compile_fail_test.cpp
+    return_void_and_return_value_compile_fail_test.cpp
+    ambiguous_operator_co_await_compile_fail_test.cpp)
+
+foreach(co2_test_source IN LISTS co2_compile_fail_test_sources)
+    co2_test_target_name("${co2_test_source}" co2_test_target)
+    add_library(${co2_test_target}-control OBJECT ${co2_test_source})
+    co2_configure_test_target(${co2_test_target}-control)
+    add_library(${co2_test_target} OBJECT EXCLUDE_FROM_ALL ${co2_test_source})
+    co2_configure_test_target(${co2_test_target})
+    target_compile_definitions(${co2_test_target} PRIVATE CO2_EXPECT_COMPILE_FAILURE)
+    add_test(NAME ${co2_test_target}
+             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+                     --target ${co2_test_target} --config $<CONFIG>)
+    # 这些测试会调用构建工具；串行执行，避免并行 ctest 下同时写构建目录。
+    set_tests_properties(${co2_test_target}
+                         PROPERTIES WILL_FAIL TRUE RESOURCE_LOCK co2-build-tree)
+endforeach()
+
+# 每个公共头文件都必须能单独包含。
+file(GLOB_RECURSE co2_public_headers CONFIGURE_DEPENDS
+     "${PROJECT_SOURCE_DIR}/include/co2/*.hpp")
+set(co2_header_test_sources)
+foreach(co2_public_header IN LISTS co2_public_headers)
+    file(RELATIVE_PATH co2_header_include "${PROJECT_SOURCE_DIR}/include"
+         "${co2_public_header}")
+    string(MAKE_C_IDENTIFIER "${co2_header_include}" co2_header_identifier)
+    set(co2_header_test_source
+        "${CMAKE_CURRENT_BINARY_DIR}/header-self-containment/${co2_header_identifier}.cpp")
+    file(GENERATE OUTPUT "${co2_header_test_source}"
+         CONTENT "#include <${co2_header_include}>\n")
+    list(APPEND co2_header_test_sources "${co2_header_test_source}")
+endforeach()
+
+add_library(co2-header-self-containment-tests OBJECT ${co2_header_test_sources})
+co2_configure_test_target(co2-header-self-containment-tests)
+
+# 与原生 co_await 的差分测试只在编译器支持标准协程时构建。
+if("cxx_std_20" IN_LIST CMAKE_CXX_COMPILE_FEATURES)
+    foreach(co2_cpp20_source IN ITEMS differential_tests.cpp)
+        co2_test_target_name("${co2_cpp20_source}" co2_test_target)
+        add_executable(${co2_test_target} ${co2_cpp20_source})
+        co2_configure_test_target(${co2_test_target})
+        if(CO2_TEST_CXX_STANDARD LESS 20)
+            set_target_properties(${co2_test_target} PROPERTIES CXX_STANDARD 20)
+        endif()
+        add_test(NAME ${co2_test_target} COMMAND ${co2_test_target})
+    endforeach()
+endif()
