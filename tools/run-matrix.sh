@@ -7,6 +7,8 @@ set -uo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 AW_CXX=${AW_CXX:-/workspace/zigbin/zig-c++}
 AW_CXX_ASAN=${AW_CXX_ASAN:-/workspace/zigbin/clang20++}
+# asio 对照组（tests/asio_parity）；设为空字符串可跳过。
+AW_ASIO_ROOT=${AW_ASIO_ROOT-/workspace/asio}
 export ASAN_OPTIONS=${ASAN_OPTIONS:-detect_leaks=0}
 export UBSAN_OPTIONS=${UBSAN_OPTIONS:-print_stacktrace=1}
 configs=("$@")
@@ -20,7 +22,7 @@ for c in "${configs[@]}"; do
     dir=$root/build/matrix/$c
     log=$root/build/matrix/$c.log
     mkdir -p "$root/build/matrix"
-    if ! (cd "$root" && CXX=$cxx cmake --preset "$preset" -B "$dir" -DAW_TEST_CXX_STANDARD="$std") > "$log" 2>&1; then
+    if ! (cd "$root" && CXX=$cxx cmake --preset "$preset" -B "$dir" -DAW_TEST_CXX_STANDARD="$std" -DAW_ASIO_ROOT="$AW_ASIO_ROOT") > "$log" 2>&1; then
         echo "$c: CONFIGURE FAILED (see $log)"; status=1; continue
     fi
     if ! cmake --build "$dir" -j8 >> "$log" 2>&1; then

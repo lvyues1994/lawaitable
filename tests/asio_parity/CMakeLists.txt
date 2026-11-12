@@ -1,0 +1,11 @@
+# §14.3：与 asio 190a8d8 原生协程的行为对照，固定 C++20。asio 只用于测试和基准。
+if(NOT AW_ASIO_ROOT)
+    message(STATUS "AW_ASIO_ROOT not set: tests/asio_parity skipped")
+    return()
+endif()
+add_executable(aw-asio-parity-test asio_parity_test.cpp)
+aw_configure_test(aw-asio-parity-test)
+set_target_properties(aw-asio-parity-test PROPERTIES CXX_STANDARD 20)
+target_include_directories(aw-asio-parity-test SYSTEM PRIVATE ${AW_ASIO_ROOT}/asio/include)
+target_compile_definitions(aw-asio-parity-test PRIVATE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+add_test(NAME aw-asio-parity-test COMMAND aw-asio-parity-test)
