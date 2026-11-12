@@ -6,6 +6,9 @@
 #include <type_traits>
 #include <utility>
 
+#include "awaitable/cancel/cancellation_state.hpp"
+#include "awaitable/cancel/stop_token.hpp"
+#include "awaitable/cancel/stop_token_adapter.hpp"
 #include "awaitable/core/coroutine.hpp"
 #include "awaitable/error.hpp"
 #include "awaitable/exec/detail/recycling_allocator.hpp"
@@ -160,6 +163,41 @@ template <class Executor> class awaitable_frame_base {
                       "use_awaitable operations, this_coro queries and async_generator::next()");
         return {};
     }
+
+    // ---- §4.5 / §6.2 / §6.4：取消相关的 this_coro 查询（Task 13）----
+
+    template <class V> struct ready_value {
+        V value;
+        bool await_ready() const noexcept { return true; }
+        void await_suspend(co2::coroutine_handle<>) const noexcept {}
+        V await_resume() { return std::move(value); }
+    };
+
+    ready_value<cancellation_state> await_transform(this_coro::cancellation_state_t) const noexcept {
+        return ready_value<cancellation_state>{entry()->cancellation_state_};
+    }
+
+    template <class In, class Out>
+    co2::suspend_never await_transform(this_coro::reset_cancellation_state_t<In, Out> reset) const {
+        entry()->reset_cancellation_state(reset.in, reset.out);
+        return {};
+    }
+
+    ready_value<bool> await_transform(this_coro::throw_if_cancelled_0_t) const noexcept {
+        return ready_value<bool>{entry()->throw_if_cancelled_};
+    }
+
+    co2::suspend_never await_transform(this_coro::throw_if_cancelled_1_t set) const noexcept {
+        entry()->throw_if_cancelled_ = set.value;
+        return {};
+    }
+
+    ready_value<stop_token> await_transform(get_stop_token_t) const {
+        return ready_value<stop_token>{entry()->bridge().token()};
+    }
+
+    // coro 旧写法：inherit_stop_token(into, handle) 借用这里的 EnvStopToken（§6.4）。
+    detail::EnvStopToken const& envStopToken() const { return entry()->bridge().env(); }
 
     void throw_if_cancelled_now() const {
         entry_frame_base<Executor>* const e = entry();

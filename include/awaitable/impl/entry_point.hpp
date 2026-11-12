@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <exception>
 #include <new>
 #include <type_traits>
@@ -7,6 +8,7 @@
 
 #include "awaitable/associated.hpp"
 #include "awaitable/awaitable.hpp"
+#include "awaitable/cancel/cancellation_signal.hpp"
 #include "awaitable/core/contract.hpp"
 #include "awaitable/exec/detail/recycling_allocator.hpp"
 #include "awaitable/exec/detail/thread_context.hpp"
@@ -46,6 +48,69 @@ template <class Handler> struct deliver_void_op {
     void operator()() { handler(e); }
 };
 
+// §8.2：token 带关联 slot 时的取消桥。slot 处理器和入口帧各持一个引用；处理器可能在
+// 执行线程结束后才运行，所以 signal 住在这个引用计数块里（asio impl/co_spawn.hpp:240-291）。
+class spawn_cancellation_bridge {
+  public:
+    static spawn_cancellation_bridge* create() {
+        void* const memory = recycling_allocate(mem_tag::cancellation_signal,
+                                                sizeof(spawn_cancellation_bridge),
+                                                alignof(spawn_cancellation_bridge));
+        return ::new (memory) spawn_cancellation_bridge;
+    }
+
+    void add_ref() noexcept { refs_.fetch_add(1U, std::memory_order_relaxed); }
+    void release() noexcept {
+        if (refs_.fetch_sub(1U, std::memory_order_acq_rel) == 1U) {
+            this->~spawn_cancellation_bridge();
+            recycling_deallocate(mem_tag::cancellation_signal, this, sizeof(spawn_cancellation_bridge));
+        }
+    }
+
+    cancellation_signal& signal() noexcept { return signal_; }
+
+  private:
+    spawn_cancellation_bridge() noexcept = default;
+    spawn_cancellation_bridge(spawn_cancellation_bridge const&) = delete;
+    spawn_cancellation_bridge& operator=(spawn_cancellation_bridge const&) = delete;
+    ~spawn_cancellation_bridge() = default;
+
+    std::atomic<unsigned> refs_{1U};
+    cancellation_signal signal_;
+};
+
+struct bridge_ref {
+    spawn_cancellation_bridge* bridge;
+    explicit bridge_ref(spawn_cancellation_bridge* b) noexcept : bridge{b} {}
+    bridge_ref(bridge_ref&& other) noexcept : bridge{other.bridge} { other.bridge = nullptr; }
+    bridge_ref(bridge_ref const&) = delete;
+    bridge_ref& operator=(bridge_ref const&) = delete;
+    ~bridge_ref() {
+        if (bridge != nullptr) bridge->release();
+    }
+};
+
+// 在协程的 executor 上 emit（§6.2 第 7 条）。
+struct spawn_emit_op {
+    bridge_ref ref;
+    cancellation_type type;
+    void operator()() { ref.bridge->signal().emit(type); }
+};
+
+// 装在 token 的 slot 上：可以在任何线程被 emit，先 dispatch 到 ex。
+template <class Executor> struct spawn_cancellation_handler {
+    bridge_ref ref;
+    Executor ex;
+    spawn_cancellation_handler(spawn_cancellation_bridge* bridge, Executor const& e) noexcept
+        : ref{bridge}, ex{e} {
+        bridge->add_ref();
+    }
+    void operator()(cancellation_type type) {
+        ref.bridge->add_ref();
+        ex.dispatch(spawn_emit_op{bridge_ref{ref.bridge}, type});
+    }
+};
+
 // §7.2：手写入口帧。状态机：开始（压入用户帧）→ 运行中 → [启动期完成：先 post] → 交付。
 template <class Executor, class T, class Handler>
 class entry_frame_impl final : public entry_frame_base<Executor> {
@@ -64,6 +129,11 @@ class entry_frame_impl final : public entry_frame_base<Executor> {
         }
     }
 
+    void hold_bridge(spawn_cancellation_bridge* bridge) {
+        bridge_ = bridge;
+        this->use_parent_slot(bridge->signal().slot());
+    }
+
   private:
     enum class state : unsigned char { start, running, deliver };
 
@@ -72,7 +142,13 @@ class entry_frame_impl final : public entry_frame_base<Executor> {
         : base{ex}, user_{std::move(user)}, handler_(std::forward<H>(handler)) {
         this->block_.header = co2::detail::FrameHeader{&destroy_entry, &step_entry, false, false};
     }
-    ~entry_frame_impl() = default;
+    ~entry_frame_impl() {
+        if (bridge_ != nullptr) {
+            this->parent_slot_.clear();
+            this->parent_slot_ = cancellation_slot{};
+            bridge_->release();
+        }
+    }
 
     static entry_frame_impl* from(co2::detail::FrameHeader* header) noexcept {
         return static_cast<entry_frame_impl*>(
@@ -163,6 +239,7 @@ class entry_frame_impl final : public entry_frame_base<Executor> {
     awaitable<T, Executor> user_;
     Handler handler_;
     state state_{state::start};
+    spawn_cancellation_bridge* bridge_{nullptr};
 };
 
 template <class Executor> struct launch_op {
@@ -175,9 +252,15 @@ template <class Executor> struct initiate_co_spawn {
 
     template <class Handler, class T> void operator()(Handler&& handler, awaitable<T, Executor> a) const {
         using handler_type = typename std::decay<Handler>::type;
+        cancellation_slot const slot = get_associated_cancellation_slot(handler);
         auto* const entry = entry_frame_impl<Executor, T, handler_type>::create(
             ex, std::move(a), std::forward<Handler>(handler));
         awaitable_thread<Executor> thread{entry};
+        if (slot.is_connected()) {
+            spawn_cancellation_bridge* const bridge = spawn_cancellation_bridge::create();
+            entry->hold_bridge(bridge); // 入口帧的引用
+            cancellation_slot{slot}.template emplace<spawn_cancellation_handler<Executor>>(bridge, ex);
+        }
         // §7.3 第 3 条：先 dispatch 到 ex，再 launch。
         ex.dispatch(launch_op<Executor>{std::move(thread)});
     }

@@ -5,14 +5,13 @@
 
 #include "awaitable/cancel/cancellation_signal.hpp"
 #include "awaitable/cancel/cancellation_state.hpp"
+#include "awaitable/cancel/stop_token_adapter.hpp"
 #include "awaitable/core/coroutine_handle.hpp"
 #include "awaitable/exec/detail/thread_context.hpp"
 #include "awaitable/impl/awaitable_frame.hpp"
 
 namespace aw {
 namespace detail {
-
-class stop_bridge;
 
 // 入口帧（栈底）。帧头与 core 兼容，可被 pump 恢复；状态机由 entry_frame_impl 实现。
 template <class Executor> class entry_frame_base : public awaitable_frame_base<Executor> {
@@ -28,6 +27,34 @@ template <class Executor> class entry_frame_base : public awaitable_frame_base<E
         top_of_stack_ = this;
         parent_slot_ = internal_signal_.slot();
         cancellation_state_ = cancellation_state{parent_slot_};
+    }
+    entry_frame_base(entry_frame_base const&) = delete;
+    entry_frame_base& operator=(entry_frame_base const&) = delete;
+    ~entry_frame_base() {
+        // 先拆掉父 slot 上的状态处理器（它的观察者指向 stop_bridge），再释放桥。
+        parent_slot_.clear();
+        if (stop_bridge_ != nullptr) stop_bridge::destroy(stop_bridge_);
+    }
+
+    // co_spawn 的 token 带关联 slot 时，父 slot 改为引用计数桥里的 signal（§8.2）。
+    void use_parent_slot(cancellation_slot parent) {
+        parent_slot_.clear();
+        parent_slot_ = parent;
+        cancellation_state_ = cancellation_state{parent_slot_};
+    }
+
+    template <class In, class Out> void reset_cancellation_state(In in, Out out) {
+        cancellation_state_ = cancellation_state{parent_slot_, in, out};
+        if (stop_bridge_ != nullptr) stop_bridge_->attach(cancellation_state_);
+    }
+
+    // §6.4：第一次取 stop_token 时惰性创建桥。
+    stop_bridge& bridge() {
+        if (stop_bridge_ == nullptr) {
+            stop_bridge_ = stop_bridge::create();
+            stop_bridge_->attach(cancellation_state_);
+        }
+        return *stop_bridge_;
     }
 
     header_block block_{};
