@@ -146,6 +146,7 @@
 - `async_generator` 的左值 yield 是拷贝出去的，右值才移动（Task 15）。
 - 异线程完成（`bridge_cross_thread`）不可能零分配：完成发生在非库线程，回收缓存按设计不在那里工作，asio 在这一项同样是 1 次。§15.4 第 4 条对这一项无法满足（Task 20）。
 - asio 没有 async_generator，`generator_yield_1000` 只和 coro / 缓存关比较（Task 20）。
+- 执行期修正（2026-11-13，用户同意）：Task 18 场景 6（affinity）的 asio 侧原先在 asio 池线程上 `std::vector<std::thread>::emplace_back` 启动外部线程，主线程在 `future.get()` 返回后遍历该 vector 并 join，二者存在数据竞争（TSan 下约 15% 失败，偶发 terminate）。现改为与 aw 侧相同的 `aw_test::foreign_threads`（加锁登记、析构时 join），并让它在 asio 线程池之前析构。只改测试，不改库。
 
 ---
 
@@ -9985,11 +9986,11 @@ void scenario_operators() {
 // ============================================================================
 // 场景 6：异步操作在别的线程完成，恢复时 running_in_this_thread() 为真
 // ============================================================================
-template <class Token> auto asio_from_foreign_thread(std::vector<std::thread>& threads, int v, Token&& token) {
+template <class Token> auto asio_from_foreign_thread(aw_test::foreign_threads& threads, int v, Token&& token) {
     return asio::async_initiate<Token, void(std::error_code, int)>(
         [&threads, v](auto handler) {
             auto ex = asio::get_associated_executor(handler);
-            threads.emplace_back([ex, v, h = std::move(handler)]() mutable {
+            threads.start([ex, v, h = std::move(handler)]() mutable {
                 asio::dispatch(ex, [h = std::move(h), v]() mutable { std::move(h)(std::error_code{}, v); });
             });
         },
@@ -9997,7 +9998,7 @@ template <class Token> auto asio_from_foreign_thread(std::vector<std::thread>& t
 }
 
 asio::awaitable<void> asio_affinity(trace_t& t, asio::thread_pool::executor_type ex,
-                                    std::vector<std::thread>& threads) {
+                                    aw_test::foreign_threads& threads) {
     int v = co_await asio_from_foreign_thread(threads, 5, asio::use_awaitable);
     t.add("value " + std::to_string(v) + " on own executor " + std::to_string(ex.running_in_this_thread()));
 }
@@ -10019,10 +10020,9 @@ void scenario_affinity() {
         aw::co_spawn(pool, aw_affinity(a, pool.get_executor(), &threads), aw::use_future).get();
     }
     {
-        std::vector<std::thread> threads;
         asio::thread_pool pool{2};
+        aw_test::foreign_threads threads; // 在 pool 之前析构：先 join 外部线程，再销毁 pool
         asio::co_spawn(pool, asio_affinity(b, pool.get_executor(), threads), asio::use_future).get();
-        for (auto& th : threads) th.join();
         pool.join();
     }
     compare("affinity", a, b);
