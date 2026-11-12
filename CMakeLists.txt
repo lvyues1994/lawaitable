@@ -20,6 +20,12 @@ set_property(CACHE AW_TEST_CXX_STANDARD PROPERTY STRINGS 14 17 20)
 option(AW_BUILD_TESTS "Build awaitable tests" ${PROJECT_IS_TOP_LEVEL})
 set(AW_ASIO_ROOT "" CACHE PATH "asio source tree (contains asio/include); enables tests/asio_parity and the asio benchmarks")
 
+option(AW_BUILD_BENCHMARKS "Build awaitable benchmarks (benchmarks/)" OFF)
+
+if(AW_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif()
+
 if(AW_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
