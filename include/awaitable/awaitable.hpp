@@ -43,7 +43,7 @@ template <class T, class Executor> class awaitable {
 
   private:
     template <class, class> friend class detail::awaitable_frame;
-    template <class, class, class> friend class detail::entry_frame_impl;
+    template <class, class, class, class> friend class detail::entry_frame_impl;
 
     explicit awaitable(detail::awaitable_frame<T, Executor>* frame) noexcept : frame_{frame} {}
 

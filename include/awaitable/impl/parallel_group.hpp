@@ -8,10 +8,10 @@
 #include <utility>
 
 #include "awaitable/associated.hpp"
+#include "awaitable/async_result.hpp"
 #include "awaitable/awaitable.hpp"
 #include "awaitable/cancel/cancellation_signal.hpp"
 #include "awaitable/cancel/cancellation_type.hpp"
-#include "awaitable/co_spawn.hpp"
 #include "awaitable/exec/detail/recycling_allocator.hpp"
 #include "awaitable/impl/entry_point.hpp"
 #include "awaitable/optional.hpp"
@@ -20,6 +20,9 @@ namespace aw {
 namespace detail {
 
 // §12 第 25、26 行：两个操作数各开一个子执行线程，加一个手写组状态（mem_tag::parallel_group）。
+// 验收修订第 2 项：两个子执行线程的入口帧嵌在组状态这一块里，子执行线程的父 slot 直接是
+// signals_[i]（不经 co_spawn 的取消桥）；向子执行线程 emit 时照旧先 dispatch 到 ex_（§6.2 第 7 条）。
+// 组状态按引用计数释放：两个入口帧各一份，交付一份，每个在途的 emit 操作一份。
 enum class group_condition : unsigned char {
     one_error,   // wait_for_one_error：有一个失败就取消另一个（operator&&）
     one_success, // wait_for_one_success：有一个成功就取消另一个（operator||）
@@ -61,8 +64,8 @@ template <class Executor, class T, class U, class Handler> class pair_group_stat
 
     // 在执行线程的 executor 上调用（initiation 里）。
     void start(awaitable<T, Executor> t, awaitable<U, Executor> u) {
-        co_spawn(ex_, std::move(t), bind_cancellation_slot(signals_[0].slot(), child_done<0U, T>{this}));
-        co_spawn(ex_, std::move(u), bind_cancellation_slot(signals_[1].slot(), child_done<1U, U>{this}));
+        launch_child<0U, T>(&child0_, std::move(t));
+        launch_child<1U, U>(&child1_, std::move(u));
         bool emit_now = false;
         {
             std::lock_guard<std::mutex> lock{mutex_};
@@ -76,17 +79,48 @@ template <class Executor, class T, class U, class Handler> class pair_group_stat
         finish_one(); // initiation 自己持有的那一份
     }
 
+    // 嵌入的入口帧销毁时调用（owned_entry_storage）。
+    void release_child() noexcept { release(); }
+
   private:
     pair_group_state(Handler&& handler, Executor const& ex, group_condition cond)
         : handler_(std::move(handler)), ex_{ex}, cond_{cond} {}
 
+    void release() noexcept {
+        if (refs_.fetch_sub(1U, std::memory_order_acq_rel) != 1U) return;
+        this->~pair_group_state();
+        recycling_deallocate(mem_tag::parallel_group, this, sizeof(pair_group_state));
+    }
+
     struct forward_cancel {
         pair_group_state* self;
         void operator()(cancellation_type type) {
-            self->signals_[0].emit(type);
-            self->signals_[1].emit(type);
+            self->emit_child(0U, type);
+            self->emit_child(1U, type);
         }
     };
+
+    // 在子执行线程的 executor 上 emit（原先由 co_spawn 的 spawn_cancellation_handler 完成）。
+    struct emit_op {
+        pair_group_state* self;
+        unsigned index;
+        cancellation_type type;
+        emit_op(pair_group_state* s, unsigned i, cancellation_type t) noexcept : self{s}, index{i}, type{t} {}
+        emit_op(emit_op&& other) noexcept : self{other.self}, index{other.index}, type{other.type} {
+            other.self = nullptr;
+        }
+        emit_op(emit_op const&) = delete;
+        emit_op& operator=(emit_op const&) = delete;
+        ~emit_op() {
+            if (self != nullptr) self->release();
+        }
+        void operator()() { self->signals_[index].emit(type); }
+    };
+
+    void emit_child(unsigned index, cancellation_type type) {
+        refs_.fetch_add(1U, std::memory_order_relaxed);
+        ex_.dispatch(emit_op{this, index, type});
+    }
 
     template <unsigned I, class V> struct child_done {
         pair_group_state* self;
@@ -96,6 +130,18 @@ template <class Executor, class T, class U, class Handler> class pair_group_stat
             self->finish_one();
         }
     };
+
+    using storage_type = owned_entry_storage<pair_group_state>;
+    template <unsigned I, class V>
+    using child_entry = entry_frame_impl<Executor, V, child_done<I, V>, storage_type>;
+
+    // §7.3 第 3 条：与 co_spawn 相同，先 dispatch 到 ex_，再 launch。
+    template <unsigned I, class V, class Memory> void launch_child(Memory* memory, awaitable<V, Executor> a) {
+        auto* const entry = child_entry<I, V>::construct_at(memory, storage_type{this}, ex_, signals_[I].slot(),
+                                                            std::move(a), child_done<I, V>{this});
+        awaitable_thread<Executor> thread{entry};
+        ex_.dispatch(launch_op<Executor>{std::move(thread)});
+    }
 
     void store(std::integral_constant<unsigned, 0U>, std::exception_ptr e) { outcome_.e0 = std::move(e); }
     void store(std::integral_constant<unsigned, 1U>, std::exception_ptr e) { outcome_.e1 = std::move(e); }
@@ -128,7 +174,7 @@ template <class Executor, class T, class U, class Handler> class pair_group_stat
         if (emit_now) emit_others(index);
     }
 
-    void emit_others(unsigned winner) { signals_[winner == 0U ? 1U : 0U].emit(cancellation_type::all); }
+    void emit_others(unsigned winner) { emit_child(winner == 0U ? 1U : 0U, cancellation_type::all); }
 
     void finish_one() {
         if (remaining_.fetch_sub(1U, std::memory_order_acq_rel) != 1U) return;
@@ -143,8 +189,7 @@ template <class Executor, class T, class U, class Handler> class pair_group_stat
             if (self->parent_slot_.is_connected()) self->parent_slot_.clear();
             Handler handler(std::move(self->handler_));
             outcome_type outcome(std::move(self->outcome_));
-            self->~pair_group_state();
-            recycling_deallocate(mem_tag::parallel_group, self, sizeof(pair_group_state));
+            self->release(); // 交付的那一份；入口帧可能还没销毁
             handler(std::move(outcome));
         }
     };
@@ -156,12 +201,15 @@ template <class Executor, class T, class U, class Handler> class pair_group_stat
     cancellation_slot parent_slot_{};
     outcome_type outcome_{};
     std::atomic<unsigned> remaining_{3U}; // 两个子执行线程 + initiation
+    std::atomic<unsigned> refs_{3U};      // 两个入口帧 + 交付 + 在途 emit
     std::mutex mutex_;
     unsigned completed_{0U};
     bool spawned_{false};
     bool cancel_claimed_{false};
     bool cancel_pending_{false};
     unsigned pending_target_{0U};
+    alignas(child_entry<0U, T>) unsigned char child0_[sizeof(child_entry<0U, T>)];
+    alignas(child_entry<1U, U>) unsigned char child1_[sizeof(child_entry<1U, U>)];
 };
 
 template <class Executor> struct initiate_pair_group {

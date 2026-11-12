@@ -458,7 +458,7 @@ public:
 
 1. **取消状态的位置。** 每个执行线程在入口帧里有一个内部 `cancellation_signal` 和一个 `cancellation_state`，后者挂在前者的 slot 上，也就是父 slot。默认过滤器是 `enable_terminal_cancellation`。外部取消从这个内部 signal 进来：
    - `co_spawn` 的 token 带关联 slot 时，外部 emit 经 dispatch 转到这里（§8.2）；
-   - `||` / `&&` 的子执行线程由组状态在这里 emit（§6.3）。
+   - `||` / `&&` 的子执行线程例外：父 slot 直接是组状态里的 signal（不经内部 signal，也不经 co_spawn 的取消桥），组状态先 dispatch 到子执行线程的 executor 再 emit（§6.3）。
 2. **送达当前操作。** 帧发起异步操作时，完成回调的关联 slot 就是 `cancellation_state.slot()`。操作在这个 slot 上安装自己的处理器。操作完成后，回调在恢复协程前调用 `clear_cancellation_slot()`。
 3. **记录。** 父 slot 上 emit 的类型先经过 in 过滤器写进 `cancelled()`，再经过 out 过滤器转给当前操作的 slot。
 4. **throw_if_cancelled 默认开**（asio impl/awaitable.hpp:615）。只要 `cancelled() != none`，下一次 `CO2_AWAIT` 会在发起之前抛出 `operation_aborted`（§4.3）。用 `this_coro::throw_if_cancelled(false)` 可以关闭。
@@ -474,6 +474,7 @@ public:
 
 - 父执行线程收到的取消，会转给 `||` / `&&` 的所有子执行线程。
 - 某个子线程决出结果后，其余子线程收到 `cancellation_type::all`，与 asio `wait_for_one` / `wait_for_one_success` / `wait_for_one_error` 的默认值相同（experimental/cancellation_condition.hpp:41-69）。
+- 两个子执行线程的入口帧嵌在组状态那一块内存里（`mem_tag::parallel_group`），不单独分配。组状态按引用计数释放：两个入口帧各一份、交付一份、每个在途的 emit 操作一份。所有对子执行线程的 emit（父取消转发、决出结果后的取消）都先 `dispatch` 到组的 executor，这与 co_spawn 取消桥的 `spawn_cancellation_handler` 语义相同。（2026-11-13 验收修订第 2 项）
 
 ### 6.4 stop_token 适配器
 
@@ -767,7 +768,7 @@ sequenceDiagram
 | `post` / `dispatch` 普通函数 | 1 个 operation | `executor_function` |
 | 恢复一个执行线程（回调排队） | 1 个 operation | `executor_function` |
 | `co_spawn` | 2（用户帧 + 入口帧）；token 带 slot 时 +1 | `awaitable_frame`、`cancellation_signal` |
-| `a && b` / `a \|\| b` | 每个操作数 1 个入口帧，另加 1 个组状态 | `awaitable_frame`、`parallel_group` |
+| `a && b` / `a \|\| b` | 1 个组状态（内含两个操作数的入口帧）；另有两个子执行线程的取消状态处理器和父 slot 上的 1 个转发处理器。操作数帧和运算符协程帧算在“创建 awaitable 帧”里 | `parallel_group`、`cancellation_signal` |
 | strand 投递 | 1 个 operation；invoker 复用 | `executor_function` |
 | `async_generator` 一次 yield | 0 | — |
 | 取消处理器 emplace | 复用旧块；第一次 1 块 | `cancellation_signal` |
@@ -1043,5 +1044,7 @@ asio 版本是 `190a8d8`。
      - 补上约定的两张时序图（§8.5：① 等待子协程，② 等待 use_awaitable 异步操作）。类型名和规则与 §4–§8 一致：`push_frame` / `pop_frame` 是帧的成员；executor 和取消状态放在入口帧里，由执行线程共享；同步完成时走 post 分支。两张图都用 mermaid 11 的解析器（`mermaid.parse`，在 jsdom 下运行）校验通过。
    - 定案同步（2026-11-12）：§16 由“开放问题”改为“已定决策 D1–D12”；正文中引用 Q 的地方改为 D；§10.1 写明 `next()` 返回 `aw::optional<T>` 的迁移方式和 CamelCase→snake_case 命名对照；§3.1 改为“夹具与 legacy 测试原样，core 文件经转发头接入”，使原样校验覆盖夹具与测试；§14.1 补上 03 回归测试文件名，legacy ctest 合计 27 项；§15.4 第 5 条写明校验脚本。
 3. **范围：** 只覆盖一个库的 v1；core 的搬运作为实现计划的第一步。没有引入批准范围之外的功能：`deferred`、默认 token、捕获包装都被明确排除。
-4. **验收修订（2026-11-13）：** 按用户决定，§15.4 第 4 条豁免 `bridge_cross_thread`（非库线程完成，依据 D12，asio 同为 1 次）；`tools/check-acceptance.py` 同步把该项改为 EXEMPT。
+4. **验收修订（2026-11-13）：**
+   - 第 1 项：按用户决定，§15.4 第 4 条豁免 `bridge_cross_thread`（非库线程完成，依据 D12，asio 同为 1 次）；`tools/check-acceptance.py` 同步把该项改为 EXEMPT。
+   - 第 2 项：`||` / `&&` 的子执行线程入口帧并进组状态，子执行线程的父 slot 直接用组状态的 signal，去掉 co_spawn 取消桥和入口帧内部 signal 上那次多余的状态安装（§6.2 第 1 条、§6.3、§9.3）。稳态每次运算的全局 `operator new` 从 9 次降到 2 次（asio 5 次）。剩下的 2 次来自同标签 3 块同时存活而缓存只有 2 格：运算符协程帧与两个操作数帧，转发处理器与两个子取消状态。要降到 0，需要改缓存格数或设计，所以没有做（benchmarks/results/2026-11-13-operators-merge.md）。组状态大于 1020 B（操作数值类型很大时）就不进缓存，每次运算多 1 次分配。
 5. **歧义消除：** “热路径”“库线程”在 §0 定义；“1.2 倍”指同一项的中位耗时；“分配次数不多于 asio”逐项比较；“core 原样”的可检查形式见 §15.4 第 5 条。

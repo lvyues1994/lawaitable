@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <exception>
 #include <new>
 #include <type_traits>
@@ -111,9 +112,21 @@ template <class Executor> struct spawn_cancellation_handler {
     }
 };
 
+// 入口帧内存的两种来源：co_spawn 从回收缓存单独分配；运算符的组状态把入口帧嵌在自己的
+// 那一块里（验收修订第 2 项），入口帧销毁时只析构、再通知所有者。
+struct recycled_entry_storage {
+    void release(void* memory, std::size_t size) noexcept {
+        recycling_deallocate(mem_tag::awaitable_frame, memory, size);
+    }
+};
+template <class Owner> struct owned_entry_storage {
+    Owner* owner;
+    void release(void*, std::size_t) noexcept { owner->release_child(); }
+};
+
 // §7.2：手写入口帧。状态机：开始（压入用户帧）→ 运行中 → [启动期完成：先 post] → 交付。
-template <class Executor, class T, class Handler>
-class entry_frame_impl final : public entry_frame_base<Executor> {
+template <class Executor, class T, class Handler, class Storage>
+class entry_frame_impl final : public entry_frame_base<Executor>, private Storage {
     using base = entry_frame_base<Executor>;
 
   public:
@@ -129,6 +142,14 @@ class entry_frame_impl final : public entry_frame_base<Executor> {
         }
     }
 
+    // 在调用方给的内存里构造；父 slot 直接用调用方的（不经取消桥）。
+    template <class H>
+    static entry_frame_impl* construct_at(void* memory, Storage storage, Executor const& ex,
+                                          cancellation_slot parent, awaitable<T, Executor> user, H&& handler) {
+        return ::new (memory)
+            entry_frame_impl(storage, ex, parent, std::move(user), std::forward<H>(handler));
+    }
+
     void hold_bridge(spawn_cancellation_bridge* bridge) {
         bridge_ = bridge;
         this->use_parent_slot(bridge->signal().slot());
@@ -140,6 +161,12 @@ class entry_frame_impl final : public entry_frame_base<Executor> {
     template <class H>
     entry_frame_impl(Executor const& ex, awaitable<T, Executor> user, H&& handler)
         : base{ex}, user_{std::move(user)}, handler_(std::forward<H>(handler)) {
+        this->block_.header = co2::detail::FrameHeader{&destroy_entry, &step_entry, false, false};
+    }
+    template <class H>
+    entry_frame_impl(Storage storage, Executor const& ex, cancellation_slot parent, awaitable<T, Executor> user,
+                     H&& handler)
+        : base{ex, parent}, Storage(storage), user_{std::move(user)}, handler_(std::forward<H>(handler)) {
         this->block_.header = co2::detail::FrameHeader{&destroy_entry, &step_entry, false, false};
     }
     ~entry_frame_impl() {
@@ -157,8 +184,9 @@ class entry_frame_impl final : public entry_frame_base<Executor> {
 
     static void destroy_entry(co2::detail::FrameHeader* header) noexcept {
         entry_frame_impl* const self = from(header);
+        Storage storage(static_cast<Storage&>(*self));
         self->~entry_frame_impl();
-        recycling_deallocate(mem_tag::awaitable_frame, self, sizeof(entry_frame_impl));
+        storage.release(self, sizeof(entry_frame_impl));
     }
 
     static co2::detail::FrameHeader* step_entry(co2::detail::FrameHeader* header) {

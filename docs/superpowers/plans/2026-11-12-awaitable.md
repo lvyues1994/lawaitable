@@ -80,7 +80,7 @@
 │       │   ├── awaitable_thread.hpp           awaitable_thread、entry_frame_base（Task 10，取消部分在 Task 13 扩充）
 │       │   ├── entry_point.hpp                entry_frame_impl、co_spawn 发起（Task 10；spawn 取消桥在 Task 13）
 │       │   ├── async_op_awaiter.hpp           use_awaitable 的 awaiter 与 handler（Task 11）
-│       │   ├── parallel_group.hpp             || && 的组状态（Task 14）
+│       │   ├── parallel_group.hpp             || && 的组状态（Task 14；入口帧并入组状态见文末“验收修订第 2 项”）
 │       │   └── generator_frame.hpp            async_generator 的 promise（Task 15）
 │       ├── optional.hpp variant.hpp error.hpp multiple_exceptions.hpp   （Task 2）
 │       ├── async_result.hpp associated.hpp detached.hpp use_future.hpp post.hpp dispatch.hpp （Task 9）
@@ -146,6 +146,7 @@
 - `async_generator` 的左值 yield 是拷贝出去的，右值才移动（Task 15）。
 - 异线程完成（`bridge_cross_thread`）不可能零分配：完成发生在非库线程，回收缓存按设计不在那里工作，asio 在这一项同样是 1 次。2026-11-13 经用户决定，规格 §15.4 第 4 条已豁免这一项（依据 D12），`tools/check-acceptance.py` 对它只打印 `EXEMPT`，不计失败；它仍受第 2、3 条约束（Task 20）。
 - asio 没有 async_generator，`generator_yield_1000` 只和 coro / 缓存关比较（Task 20）。
+- 验收修订第 2 项（2026-11-13，用户决定）：`||` / `&&` 的两个子执行线程入口帧并进组状态那一块，子执行线程的父 slot 直接用组状态的 signal，不再经 `co_spawn`。Task 10、13、14 里的代码块是修订前的版本，修订作为文末“验收修订第 2 项”叠加在 Task 20 之后。
 - 执行期修正（2026-11-13，用户同意）：Task 18 场景 6（affinity）的 asio 侧原先在 asio 池线程上 `std::vector<std::thread>::emplace_back` 启动外部线程，主线程在 `future.get()` 返回后遍历该 vector 并 join，二者存在数据竞争（TSan 下约 15% 失败，偶发 terminate）。现改为与 aw 侧相同的 `aw_test::foreign_threads`（加锁登记、析构时 join），并让它在 asio 线程池之前析构。只改测试，不改库。
 
 ---
@@ -11644,4 +11645,39 @@ Expected：一张两行（aw-bench / asio-bench）的表，列出中位数、p10
 ```bash
 git add tools/bench-item-stats.py
 git commit -m "bench: multi-run stats tool for a single benchmark item"
+```
+
+---
+
+### 验收修订第 2 项：|| / && 合并分配（2026-11-13，用户决定）
+
+**目标：** 把 `||` / `&&` 的子执行线程入口帧与组状态这些同时存活的块合并成更少次分配，让 `or_ready` / `and_ready` 的分配次数不超过 asio 的 5 次，最好为 0。约束：回收缓存默认值不变（仍为 2 格），core 不改（`VERBATIM OK`）。
+
+**Files:**
+- Modify: `include/awaitable/impl/awaitable_frame.hpp`：`entry_frame_impl` 的前置声明多一个参数 `Storage`，默认值 `recycled_entry_storage`。
+- Modify: `include/awaitable/awaitable.hpp`：把 `entry_frame_impl` 的 friend 声明改为 4 个模板参数。
+- Modify: `include/awaitable/impl/awaitable_thread.hpp`：`entry_frame_base` 新增构造函数 `(Executor const&, cancellation_slot parent)`，直接把调用方给的 slot 当作父 slot，不先在 `internal_signal_` 上安装一次状态。
+- Modify: `include/awaitable/impl/entry_point.hpp`：
+  - 新增 `recycled_entry_storage`（照旧归还给回收缓存）和 `owned_entry_storage<Owner>`（只析构，然后调用 `owner->release_child()`）。
+  - `entry_frame_impl` 私有继承 `Storage`，这是空基类，co_spawn 入口帧的大小不变，仍是 184 B。
+  - 新增 `construct_at(memory, storage, ex, parent_slot, user, handler)`。
+  - `destroy_entry` 先拷出 `Storage`，再析构，最后调用 `release`。
+- Modify: `include/awaitable/impl/parallel_group.hpp`：
+  - 组状态里放 `child0_` / `child1_` 两块对齐存储，用 `construct_at` 原地构造子入口帧，父 slot 为 `signals_[i].slot()`，然后 `ex_.dispatch(launch_op)`。
+  - 新增引用计数 `refs_`，初值 3：两个入口帧加交付各一份；每个在途的 `emit_op` 再加一份。
+  - `forward_cancel` 和 `emit_others` 改为 `emit_child`：先加一份引用，再 `ex_.dispatch(emit_op)`，与原来的 `spawn_cancellation_handler` 语义相同。
+  - `deliver` 先移出回调和结果，然后释放交付那一份引用，最后调用回调。
+  - 不再 include `co_spawn.hpp`，改为 include `async_result.hpp`。
+- Test: `tests/unit/operators_test.cpp` 加 `operators_steady_state_allocations`：预热 100 次后数 1000 次 `ready(1) || ready(2)` / `ready(1) && ready(2)` 的全局 `operator new`，断言每次运算不超过 5 次。TSan 构建不计数。
+
+**步骤与结果：**
+1. 先写测试，确认失败：修改前稳态为 9000 次 / 1000 次运算，断言失败。
+2. 实现，测试通过：修改后为 2000 次 / 1000 次运算，即每次 2 次。
+3. 剩下 2 次的来源：插桩的缓存日志显示，`awaitable_frame` 标签上运算符协程帧与两个操作数帧同时存活；`cancellation_signal` 标签上父 slot 转发处理器与两个子取消状态同时存活。两处都是 3 块对 2 格。要降到 0，必须改缓存格数或设计，所以不做。
+4. 12 配置全套通过（54/54）；`aw-operators-test`、`aw-stress-test` 在 tsan-cxx14/17/20 各加跑 50 轮，0 失败；core 校验输出 `VERBATIM OK`。
+5. 重新跑 `tools/run-benchmarks.sh`，`or_ready` / `and_ready` 的分配一项通过。修改前后的多轮对比见 `benchmarks/results/2026-11-13-operators-merge.md`。
+
+```bash
+git add include tests/unit/operators_test.cpp benchmarks/results docs
+git commit -m "operators: embed child entry frames in the group state (or/and 9 -> 2 allocations/op)"
 ```

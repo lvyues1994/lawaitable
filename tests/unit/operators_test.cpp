@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <exception>
 #include <future>
 #include <stdexcept>
@@ -15,6 +16,7 @@
 #include "awaitable/use_future.hpp"
 #include "awaitable/variant.hpp"
 #include "check.hpp"
+#include "counting_new.hpp"
 #include "test_cancellable_ops.hpp"
 
 namespace {
@@ -228,6 +230,47 @@ void non_default_constructible_values() {
     AW_CHECK(run(ctx, non_default(ctx.get_executor())) == 9);
 }
 
+// 验收修订第 2 项：|| / && 的子执行线程入口帧与组状态合并为一次分配。
+// 稳态（预热 100 次后）每次运算的全局 operator new 次数 ≤ asio 的 5 次。
+auto ready(int v) CO2_BEG(task<int>, (v)) { CO2_RETURN(v); }
+CO2_END
+
+auto operator_loop(int n, long* or_news, long* and_news)
+    CO2_BEG(task<int>, (n, or_news, and_news), int i{}; int sum{}; aw::variant<int, int> o{};
+            std::tuple<int, int> a{}; aw_test::allocation_counter* counter{};) {
+    for (i = 0; i != n; ++i) {
+        if (i == 100) counter = new aw_test::allocation_counter{};
+        CO2_AWAIT_SET(o, ready(1) || ready(2));
+        sum += o.index() == 0U ? aw::get<0>(o) : aw::get<1>(o);
+    }
+    *or_news = counter->news();
+    delete counter;
+    counter = nullptr;
+    for (i = 0; i != n; ++i) {
+        if (i == 100) counter = new aw_test::allocation_counter{};
+        CO2_AWAIT_SET(a, ready(1) && ready(2));
+        sum += std::get<0>(a) + std::get<1>(a);
+    }
+    *and_news = counter->news();
+    delete counter;
+    CO2_RETURN(sum);
+}
+CO2_END
+
+void operators_steady_state_allocations() {
+    aw::manual_executor ctx;
+    long or_news = -1;
+    long and_news = -1;
+    int const n = 1100;
+    int const sum = run(ctx, operator_loop(n, &or_news, &and_news));
+    AW_CHECK(sum > 0);
+    if (aw_test::counting_new_enabled) {
+        std::printf("or: %ld new / 1000 ops, and: %ld new / 1000 ops\n", or_news, and_news);
+        AW_CHECK(or_news <= 5 * (n - 100));
+        AW_CHECK(and_news <= 5 * (n - 100));
+    }
+}
+
 } // namespace
 
 int main() {
@@ -241,5 +284,6 @@ int main() {
     or_result_shapes();
     parent_cancellation_reaches_both_children();
     non_default_constructible_values();
+    operators_steady_state_allocations();
     return 0;
 }

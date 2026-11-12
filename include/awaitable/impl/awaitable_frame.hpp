@@ -23,7 +23,9 @@ namespace detail {
 
 template <class Executor> class awaitable_thread;
 template <class Executor> class entry_frame_base;
-template <class Executor, class T, class Handler> class entry_frame_impl;
+struct recycled_entry_storage;
+template <class Executor, class T, class Handler, class Storage = recycled_entry_storage>
+class entry_frame_impl;
 
 // 帧 resume() 在栈上放一个，after_suspend 写进去（asio impl/awaitable.hpp:497-516）。
 struct resume_context {

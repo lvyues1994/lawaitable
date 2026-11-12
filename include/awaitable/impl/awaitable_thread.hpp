@@ -28,6 +28,14 @@ template <class Executor> class entry_frame_base : public awaitable_frame_base<E
         parent_slot_ = internal_signal_.slot();
         cancellation_state_ = cancellation_state{parent_slot_};
     }
+    // 父 slot 由调用方直接给出（运算符的组状态），不先在 internal_signal_ 上装状态再换掉。
+    entry_frame_base(Executor const& ex, cancellation_slot parent) : executor_{ex} {
+        block_.self = this;
+        this->coro_ = co2::coroutine_handle<>::from_address(&block_.header);
+        top_of_stack_ = this;
+        parent_slot_ = parent;
+        cancellation_state_ = cancellation_state{parent_slot_};
+    }
     entry_frame_base(entry_frame_base const&) = delete;
     entry_frame_base& operator=(entry_frame_base const&) = delete;
     ~entry_frame_base() {
