@@ -259,7 +259,7 @@ class entry_frame_impl final : public entry_frame_base<Executor>, private Storag
             auto target = get_associated_executor(op.handler, this->executor_);
             target.dispatch(std::forward<Op>(op));
         } catch (...) {
-            this->pending_exception_ = std::current_exception();
+            this->pending_exception_.store(std::current_exception());
         }
         this->pop_frame();
     }

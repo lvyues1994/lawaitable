@@ -11,183 +11,183 @@
   "results": {
     "aw-bench": {
       "create_destroy": {
-        "ns": 7.73,
+        "ns": 6.9,
         "news": 0.0,
         "bytes": 0.0
       },
       "await_child": {
-        "ns": 16.21,
+        "ns": 12.08,
         "news": 0.0,
         "bytes": 0.0
       },
       "await_child_nested_1000": {
-        "ns": 42485.78,
+        "ns": 39320.45,
         "news": 999.0,
         "bytes": 192807.0
       },
       "bridge_same_thread": {
-        "ns": 31.98,
+        "ns": 30.76,
         "news": 0.0,
         "bytes": 0.0
       },
       "bridge_cross_thread": {
-        "ns": 3031.58,
+        "ns": 2785.22,
         "news": 1.0,
         "bytes": 41.0
       },
       "co_spawn": {
-        "ns": 87.19,
+        "ns": 79.85,
         "news": 0.0,
         "bytes": 0.0
       },
       "strand_post": {
-        "ns": 96.31,
+        "ns": 88.26,
         "news": 0.0,
         "bytes": 0.0
       },
       "generator_yield_1000": {
-        "ns": 8541.31,
+        "ns": 7179.41,
         "news": 0.0,
         "bytes": 0.0
       },
       "or_ready": {
-        "ns": 424.52,
+        "ns": 369.3,
         "news": 2.0,
         "bytes": 282.0
       },
       "and_ready": {
-        "ns": 388.17,
+        "ns": 352.33,
         "news": 2.0,
         "bytes": 266.0
       }
     },
     "aw-bench-nocache": {
       "create_destroy": {
-        "ns": 18.06,
+        "ns": 9.7,
         "news": 1.0,
         "bytes": 176.0
       },
       "await_child": {
-        "ns": 27.58,
+        "ns": 24.27,
         "news": 1.0,
         "bytes": 176.0
       },
       "await_child_nested_1000": {
-        "ns": 40855.7,
+        "ns": 36430.84,
         "news": 1001.0,
         "bytes": 192192.0
       },
       "bridge_same_thread": {
-        "ns": 39.93,
+        "ns": 36.0,
         "news": 1.0,
         "bytes": 48.0
       },
       "bridge_cross_thread": {
-        "ns": 3116.63,
+        "ns": 2786.96,
         "news": 1.0,
         "bytes": 40.0
       },
       "co_spawn": {
-        "ns": 132.29,
+        "ns": 128.18,
         "news": 4.0,
         "bytes": 440.0
       },
       "strand_post": {
-        "ns": 117.53,
+        "ns": 108.73,
         "news": 2.0,
         "bytes": 104.0
       },
       "generator_yield_1000": {
-        "ns": 8732.73,
+        "ns": 7224.35,
         "news": 1.0,
         "bytes": 208.0
       },
       "or_ready": {
-        "ns": 483.38,
+        "ns": 441.77,
         "news": 9.0,
         "bytes": 1296.0
       },
       "and_ready": {
-        "ns": 458.41,
+        "ns": 424.68,
         "news": 9.0,
         "bytes": 1280.0
       }
     },
     "asio-bench": {
       "create_destroy": {
-        "ns": 2.66,
+        "ns": 2.58,
         "news": 0.0,
         "bytes": 0.0
       },
       "await_child": {
-        "ns": 11.43,
+        "ns": 10.87,
         "news": 0.0,
         "bytes": 0.0
       },
       "await_child_nested_1000": {
-        "ns": 40257.96,
+        "ns": 37865.15,
         "news": 999.0,
         "bytes": 120879.0
       },
       "bridge_same_thread": {
-        "ns": 69.77,
+        "ns": 62.61,
         "news": 0.0,
         "bytes": 0.0
       },
       "bridge_cross_thread": {
-        "ns": 3131.62,
+        "ns": 2882.24,
         "news": 1.0,
         "bytes": 97.0
       },
       "co_spawn": {
-        "ns": 119.32,
+        "ns": 112.99,
         "news": 0.0,
         "bytes": 0.0
       },
       "strand_post": {
-        "ns": 156.21,
+        "ns": 145.99,
         "news": 0.0,
         "bytes": 0.0
       },
       "or_ready": {
-        "ns": 685.19,
+        "ns": 633.57,
         "news": 5.0,
         "bytes": 1093.0
       },
       "and_ready": {
-        "ns": 672.31,
+        "ns": 619.98,
         "news": 5.0,
         "bytes": 1101.0
       }
     },
     "coro-bench": {
       "create_destroy": {
-        "ns": 19.17,
+        "ns": 16.86,
         "news": 1.0,
         "bytes": 176.0
       },
       "await_child": {
-        "ns": 24.58,
+        "ns": 22.19,
         "news": 1.0,
         "bytes": 176.0
       },
       "await_child_nested_1000": {
-        "ns": 39467.87,
+        "ns": 35187.75,
         "news": 1001.0,
         "bytes": 176176.0
       },
       "co_spawn": {
-        "ns": 118.86,
+        "ns": 104.94,
         "news": 3.0,
         "bytes": 528.0
       },
       "generator_yield_1000": {
-        "ns": 6874.74,
+        "ns": 5918.37,
         "news": 1.0,
         "bytes": 176.0
       },
       "and_ready": {
-        "ns": 151.89,
+        "ns": 131.69,
         "news": 4.0,
         "bytes": 720.0
       }
@@ -199,12 +199,12 @@
         "bytes": 0.0
       },
       "await_child": {
-        "ns": 17.85,
+        "ns": 16.85,
         "news": 1.0,
         "bytes": 40.0
       },
       "await_child_nested_1000": {
-        "ns": 23750.92,
+        "ns": 21997.22,
         "news": 1001.0,
         "bytes": 48048.0
       }

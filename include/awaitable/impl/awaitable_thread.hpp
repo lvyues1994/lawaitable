@@ -118,7 +118,7 @@ template <class Executor> class awaitable_thread {
     void complete() {
         entry_frame_base<Executor>* const entry = bottom_of_stack_;
         bottom_of_stack_ = nullptr;
-        std::exception_ptr e = std::move(entry->pending_exception_);
+        std::exception_ptr e = entry->pending_exception_.take();
         entry->destroy();
         if (e) std::rethrow_exception(e);
     }

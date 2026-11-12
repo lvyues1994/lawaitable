@@ -10,6 +10,17 @@
 #define AW_RECYCLING_ALLOCATOR_CACHE_SIZE 2
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define AW_DETAIL_ALWAYS_INLINE inline __attribute__((always_inline))
+#define AW_DETAIL_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define AW_DETAIL_ALWAYS_INLINE __forceinline
+#define AW_DETAIL_NOINLINE __declspec(noinline)
+#else
+#define AW_DETAIL_ALWAYS_INLINE inline
+#define AW_DETAIL_NOINLINE
+#endif
+
 namespace aw {
 namespace detail {
 
@@ -48,21 +59,27 @@ class thread_info {
         return pointer;
     }
 
-    void* allocate(mem_tag tag, std::size_t size, std::size_t align) {
+    // 快路径内联：命中缓存只做几次比较。对齐检查用掩码（align 是 2 的幂，见
+    // recycling_allocate 的契约），不用取模——运行期的 % 会编译成除法指令。
+    AW_DETAIL_ALWAYS_INLINE void* allocate(mem_tag tag, std::size_t size, std::size_t align) {
         std::size_t const chunks = (size + chunk_size - 1U) / chunk_size;
         auto& row = reusable_[static_cast<std::size_t>(tag)];
         for (auto& cell : row) {
             if (cell == nullptr) continue;
             auto* const mem = static_cast<unsigned char*>(cell);
             if (static_cast<std::size_t>(mem[0]) >= chunks &&
-                reinterpret_cast<std::size_t>(cell) % align == 0U) {
+                (reinterpret_cast<std::size_t>(cell) & (align - 1U)) == 0U) {
                 void* const pointer = cell;
                 cell = nullptr;
                 mem[size] = mem[0];
                 return pointer;
             }
         }
-        // 没有合适的块：先放掉一块缓存，避免缓存里囤着不合用的块。
+        return allocate_miss(row, size);
+    }
+
+    // 没有合适的块：先放掉一块缓存，避免缓存里囤着不合用的块。
+    AW_DETAIL_NOINLINE static void* allocate_miss(void* (&row)[cache_size], std::size_t size) {
         for (auto& cell : row) {
             if (cell != nullptr) {
                 ::operator delete(cell);
@@ -98,21 +115,27 @@ class thread_context {
   public:
     thread_context() noexcept : next_{top()}, info_{next_ != nullptr ? next_->info_ : &own_} {
         top() = this;
+        info_slot() = info_;
     }
     thread_context(thread_context const&) = delete;
     thread_context& operator=(thread_context const&) = delete;
-    ~thread_context() { top() = next_; }
-
-    static thread_info* current_info() noexcept {
-        thread_context* const t = top();
-        return t != nullptr ? t->info_ : nullptr;
+    ~thread_context() {
+        top() = next_;
+        info_slot() = next_ != nullptr ? next_->info_ : nullptr;
     }
+
+    // 分配快路径每次都要读：单独存一份线程局部指针，少一次间接和判空。
+    static thread_info* current_info() noexcept { return info_slot(); }
     static bool in_library_thread() noexcept { return top() != nullptr; }
 
   private:
     static thread_context*& top() noexcept {
         static thread_local thread_context* current = nullptr;
         return current;
+    }
+    static thread_info*& info_slot() noexcept {
+        static thread_local thread_info* info = nullptr;
+        return info;
     }
 
     thread_context* next_;

@@ -741,7 +741,7 @@ sequenceDiagram
 ### 9.1 帧布局
 
 - core 的帧布局不变，顺序是：帧头 → promise → 参数副本 → 局部列表 → awaiter 槽 → allocator。
-- `awaitable_frame_base` 让 promise 多出 5 个字：`coro_`、`attached_thread_`、`caller_`、`pending_exception_`、`resume_context_`，在 64 位上是 40 B。
+- `awaitable_frame_base` 让 promise 多出 5 个字：`coro_`、`attached_thread_`、`caller_`、`pending_exception_`、`resume_context_`，在 64 位上是 40 B。其中 `pending_exception_` 是 `detail::pending_exception`：把 `std::exception_ptr` 放进 union，只在非空时析构，大小与 `std::exception_ptr` 相同（2026-11-13 验收修订第 3 项）。
 - 入口帧另外保存：executor（一个指针大小）、`top_of_stack_`、父 slot、`cancellation_state`、`throw_if_cancelled_`、启动标记、token 回调，以及 `T` 的结果存储。
 - 实现计划要用 `offsetof` / `sizeof` 探针，把各类帧的实际大小记进基准报告。
 
@@ -753,6 +753,7 @@ sequenceDiagram
 | 标签 | `default`、`awaitable_frame`、`executor_function`、`cancellation_signal`、`parallel_group` | thread_info_base.hpp:58-128 |
 | 每个标签的格数 | 2（`AW_RECYCLING_ALLOCATOR_CACHE_SIZE`，默认 2） | :36-38 |
 | 粒度 | 4 字节为一块（chunk）。分配时多要 1 字节，把块数写在 `mem[size]` 上，归还时搬到 `mem[0]`。块数超过 255 的请求不进缓存 | :163-186、226-243、310-314 |
+| 快路径（2026-11-13 验收修订第 3 项） | 命中路径强制内联，对齐检查用掩码 `p & (align - 1)`，不用取模；未命中路径不内联；`current_info()` 直接读一份线程局部的 `thread_info*` | — |
 | 命中条件 | 缓存块的块数够用，并且对齐满足要求 | :163-186 |
 | 生效范围 | 只在库线程上生效（§0）。其他线程直接对齐 new / delete | :232-271 |
 | 跨线程释放 | 释放时放进“当前线程”的缓存；当前线程不是库线程就直接 delete | 同上 |
@@ -1049,4 +1050,5 @@ asio 版本是 `190a8d8`。
    - 第 1 项：按用户决定，§15.4 第 4 条豁免 `bridge_cross_thread`（非库线程完成，依据 D12，asio 同为 1 次）；`tools/check-acceptance.py` 同步把该项改为 EXEMPT。
    - 第 2 项：`||` / `&&` 的子执行线程入口帧并进组状态，子执行线程的父 slot 直接用组状态的 signal，去掉 co_spawn 取消桥和入口帧内部 signal 上那次多余的状态安装（§6.2 第 1 条、§6.3、§9.3）。稳态每次运算的全局 `operator new` 从 9 次降到 2 次（asio 5 次）。剩下的 2 次来自同标签 3 块同时存活而缓存只有 2 格：运算符协程帧与两个操作数帧，转发处理器与两个子取消状态。要降到 0，需要改缓存格数或设计，所以没有做（benchmarks/results/2026-11-13-operators-merge.md）。组状态大于 1020 B（操作数值类型很大时）就不进缓存，每次运算多 1 次分配。
    - 跨线程项：按用户决定优化投递路径（§5.4 第 6 条）。归因结果：单核下差距全在“池线程 submit 后到完成线程开始运行”这一段，原因是池线程停车前的 pause 自旋占住唯一的核。修订后单核下 aw/asio 中位数从 1.45 降到 0.99，双核不变（0.69 → 0.70），见 benchmarks/results/2026-11-13-cross-thread-spin.md。§15.4 第 3 条对这一项已满足。
+   - 第 3 项：`await_child` 的快路径。用 callgrind 数指令，修改前每次约 300 条，asio 约 189 条；aw 层多出的部分是不内联、含 `div` 的缓存分配，两级 TLS 查找，不内联的 `throw_if_cancelled_now` / `rethrow_exception`，以及帧析构里的 `~exception_ptr` 库调用。修订后约 222 条（§9.1、§9.2）；单核 aw/asio 中位数从 1.40 降到 1.09，1000 层嵌套从 1.07 降到 1.01，见 benchmarks/results/2026-11-13-await-child.md。剩下的差距主要在 core 的宏协程状态机，没有改动。至此 `tools/check-acceptance.py` 全部通过。
 5. **歧义消除：** “热路径”“库线程”在 §0 定义；“1.2 倍”指同一项的中位耗时；“分配次数不多于 asio”逐项比较；“core 原样”的可检查形式见 §15.4 第 5 条。

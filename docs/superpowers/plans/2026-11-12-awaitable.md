@@ -148,6 +148,7 @@
 - asio 没有 async_generator，`generator_yield_1000` 只和 coro / 缓存关比较（Task 20）。
 - 验收修订第 2 项（2026-11-13，用户决定）：`||` / `&&` 的两个子执行线程入口帧并进组状态那一块，子执行线程的父 slot 直接用组状态的 signal，不再经 `co_spawn`。Task 10、13、14 里的代码块是修订前的版本，修订作为文末“验收修订第 2 项”叠加在 Task 20 之后。
 - 跨线程投递路径修订（2026-11-13，用户决定）：单 CPU 的工作线程跳过停车前的 pause 自旋，Task 5 的 thread_pool 代码块是修订前的版本，修订见文末“验收修订：跨线程投递路径”。
+- 验收修订第 3 项（2026-11-13，用户决定）：调整回收缓存快路径、帧异常存储和取消检查的内联方式。Task 3、10、13 里对应的代码块是修订前的版本，修订见文末“验收修订第 3 项”。
 - 执行期修正（2026-11-13，用户同意）：Task 18 场景 6（affinity）的 asio 侧原先在 asio 池线程上 `std::vector<std::thread>::emplace_back` 启动外部线程，主线程在 `future.get()` 返回后遍历该 vector 并 join，二者存在数据竞争（TSan 下约 15% 失败，偶发 terminate）。现改为与 aw 侧相同的 `aw_test::foreign_threads`（加锁登记、析构时 join），并让它在 asio 线程池之前析构。只改测试，不改库。
 
 ---
@@ -11713,4 +11714,44 @@ git commit -m "operators: embed child entry frames in the group state (or/and 9 
 ```bash
 git add include/awaitable/exec/thread_pool.hpp tests/unit/thread_pool_test.cpp benchmarks/results docs
 git commit -m "thread_pool: skip pause spinning when the worker has a single CPU (bridge_cross_thread 1.45x -> 0.99x)"
+```
+
+---
+
+### 验收修订第 3 项：await_child 快路径（2026-11-13，用户决定）
+
+**目标：** 在验收测法下（单核），`await_child` 的 aw/asio 不超过 1.2 倍。只改 aw 层，不改 core，不改缓存默认值。
+
+**归因：** 用 callgrind 数指令（两轮相减求出每次的条数），再用 objdump 看反汇编。aw 每次约 300 条，asio 约 189 条。aw 层多出的部分如下，数据见 `benchmarks/results/2026-11-13-await-child.md`：
+- 缓存分配没有内联，且 `% align` 编译成了 `div`；
+- 两级 TLS 查找；
+- `throw_if_cancelled_now` 和 `rethrow_exception` 没有内联；
+- 帧析构里即使为空也要调用 `~exception_ptr` 库函数。
+
+**Files:**
+- Modify: `include/awaitable/exec/detail/thread_context.hpp`：
+  - 新增 `AW_DETAIL_ALWAYS_INLINE` / `AW_DETAIL_NOINLINE`。
+  - `allocate` 的命中路径强制内联，对齐检查改用掩码，未命中路径拆到 `allocate_miss`（不内联）。
+  - `thread_context` 另存一份线程局部的 `info_slot()`，`current_info()` 直接返回它。
+- Modify: `include/awaitable/impl/awaitable_frame.hpp`：
+  - 新增 `detail::pending_exception`：union 包住 `std::exception_ptr`，只在非空时析构，接口为 `store` / `take` / `operator bool`。
+  - `rethrow_exception()` 调用不内联的 `rethrow_pending()`；`throw_if_cancelled_now()` 调用不内联的 `throw_cancelled()`。
+- Modify: `include/awaitable/impl/awaitable_thread.hpp`、`include/awaitable/impl/entry_point.hpp`：改用 `pending_exception_.take()` / `.store(...)`。
+- Test: `tests/unit/awaitable_test.cpp` 加 `pendingExceptionHoldsOnlyRealExceptions`：
+  - 初始为空；
+  - 存入空指针后仍为空；
+  - 存入后再存入会覆盖；
+  - `take` 取出后变为空；
+  - 析构时释放持有的异常。
+
+**步骤与结果：**
+1. 先写测试：`pending_exception` 还不存在，编译失败。
+2. 实现后测试通过。缓存分配和内联两处是纯性能改动，行为由已有测试覆盖。
+3. 12 个配置全套通过（54/54）。cancellation、awaitable、use_awaitable、awaitable_cancellation、operators、async_generator 及其 2 个契约测试、frame-stack differential、co2 differential、stress 共 11 项，在 tsan-cxx14/17/20 各加跑 50 轮，0 失败。core 校验输出 `VERBATIM OK`。
+4. `tools/bench-item-stats.py await_child 30 2`：aw/asio 从 1.40 降到 1.09；`await_child_nested_1000`：1.07 → 1.01。
+5. 重跑 `tools/run-benchmarks.sh`，其他项没有回退，帧大小探针不变（40 / 48 / 184 B）。`check-acceptance.py` 输出 `ACCEPTANCE OK`。
+
+```bash
+git add include tests/unit/awaitable_test.cpp benchmarks/results docs
+git commit -m "await_child fast path: inline cache hit with mask alignment, cheaper TLS, lazy exception_ptr (1.40x -> 1.09x)"
 ```

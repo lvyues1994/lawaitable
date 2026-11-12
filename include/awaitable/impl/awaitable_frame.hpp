@@ -50,6 +50,37 @@ template <class T, class Executor> struct is_awaitable_of : std::false_type {};
 template <class U, class Executor>
 struct is_awaitable_of<awaitable<U, Executor>, Executor> : std::true_type {};
 
+// 帧里待重抛的异常。std::exception_ptr 的析构在 libc++ / libstdc++ 里是不内联的库调用，
+// 即使为空也要调一次；绝大多数帧没有异常，所以放进 union，只在非空时才析构（判空是内联
+// 的指针比较）。大小与 std::exception_ptr 相同，帧布局不变（§9.1）。
+class pending_exception {
+  public:
+    pending_exception() noexcept { ::new (static_cast<void*>(&value_)) std::exception_ptr(); }
+    pending_exception(pending_exception const&) = delete;
+    pending_exception& operator=(pending_exception const&) = delete;
+    ~pending_exception() {
+        if (value_) value_.~exception_ptr();
+    }
+
+    explicit operator bool() const noexcept { return static_cast<bool>(value_); }
+
+    void store(std::exception_ptr e) noexcept {
+        if (e) value_ = std::move(e);
+    }
+
+    std::exception_ptr take() noexcept {
+        if (!value_) return std::exception_ptr{};
+        std::exception_ptr e = std::move(value_);
+        value_ = nullptr;
+        return e;
+    }
+
+  private:
+    union {
+        std::exception_ptr value_;
+    };
+};
+
 template <class Executor> class awaitable_frame_base {
   public:
     using executor_type = Executor;
@@ -76,15 +107,12 @@ template <class Executor> class awaitable_frame_base {
     };
     final_awaiter final_suspend() noexcept { return final_awaiter{this}; }
 
-    void unhandled_exception() noexcept { pending_exception_ = std::current_exception(); }
+    void unhandled_exception() noexcept { pending_exception_.store(std::current_exception()); }
 
     void rethrow_exception() {
-        if (pending_exception_) {
-            std::exception_ptr e = std::move(pending_exception_);
-            pending_exception_ = nullptr;
-            std::rethrow_exception(e);
-        }
+        if (pending_exception_) rethrow_pending();
     }
+    AW_DETAIL_NOINLINE void rethrow_pending() { std::rethrow_exception(pending_exception_.take()); }
 
     // asio impl/awaitable.hpp:480-495。
     void push_frame(awaitable_frame_base* caller) noexcept {
@@ -203,15 +231,17 @@ template <class Executor> class awaitable_frame_base {
 
     void throw_if_cancelled_now() const {
         entry_frame_base<Executor>* const e = entry();
-        if (e->throw_if_cancelled_ && !!e->cancellation_state_.cancelled())
-            throw std::system_error{std::error_code{error::operation_aborted}, "co_await"};
+        if (e->throw_if_cancelled_ && !!e->cancellation_state_.cancelled()) throw_cancelled();
+    }
+    AW_DETAIL_NOINLINE static void throw_cancelled() {
+        throw std::system_error{std::error_code{error::operation_aborted}, "co_await"};
     }
 
     // ---- 数据成员（asio :523-528）----
     co2::coroutine_handle<> coro_{};
     awaitable_thread<Executor>* attached_thread_{nullptr};
     awaitable_frame_base* caller_{nullptr};
-    std::exception_ptr pending_exception_{};
+    pending_exception pending_exception_;
     resume_context* resume_context_{nullptr};
 };
 

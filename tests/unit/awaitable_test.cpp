@@ -243,6 +243,29 @@ void runsOnThreadPool() {
     AW_CHECK(f.get() == 10);
 }
 
+// 验收修订第 3 项：帧里的待重抛异常只在真有异常时才持有 std::exception_ptr。
+void pendingExceptionHoldsOnlyRealExceptions() {
+    aw::detail::pending_exception p;
+    AW_CHECK(!p);
+    AW_CHECK(!p.take());
+    p.store(std::exception_ptr{});
+    AW_CHECK(!p); // 空指针不算异常
+    p.store(std::make_exception_ptr(std::runtime_error{"one"}));
+    AW_CHECK(!!p);
+    p.store(std::make_exception_ptr(std::runtime_error{"two"})); // 覆盖
+    std::exception_ptr e = p.take();
+    AW_CHECK(!p && e);
+    try {
+        std::rethrow_exception(e);
+    } catch (std::runtime_error const& x) {
+        AW_CHECK(std::string{x.what()} == "two");
+    }
+    {
+        aw::detail::pending_exception q;
+        q.store(std::make_exception_ptr(std::runtime_error{"dropped"})); // 析构时释放
+    }
+}
+
 } // namespace
 
 int main() {
@@ -259,5 +282,6 @@ int main() {
     abandonedThreadsAreUnwound();
     childFramesReuseRecycledMemory();
     runsOnThreadPool();
+    pendingExceptionHoldsOnlyRealExceptions();
     return 0;
 }
