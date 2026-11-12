@@ -1,7 +1,7 @@
 # awaitable 设计规格（v1）
 
 - 日期：2026-11-12
-- 状态：设计已批准，本文是实现计划的输入。本文只定义规格，不含实现代码。
+- 状态：设计已批准；§16 的 12 项于 2026-11-12 由用户确认按推荐答案定案（“同意你的推荐”）。本文是实现计划的输入，只定义规格，不含实现代码。
 - 仓库：`/workspace/awaitable`（分支 `main`）
 - 上游依据：
   - coro（co2）`0be5ab2`，以及 `/workspace/coro-issues` 的 01 / 02 / 03 三个补丁。
@@ -20,7 +20,7 @@
 | 库线程 | 由本库驱动的 OS 线程：`thread_pool` 的工作线程，以及调用 `manual_executor::run` / `run_one` / `poll` 期间的调用线程。 |
 | 热路径 | 下列操作在稳态下的一次执行：等待一个子 awaitable、一次异步桥接、一次 `co_spawn` 加完成回调、一次 strand 投递、`async_generator` 的一次 yield。 |
 
-本文的命名空间约定：新库代码在 `aw` 命名空间（理由见 §16 Q1），core 仍在 `co2`。
+本文的命名空间约定：新库代码在 `aw` 命名空间（已定决策 §16 D1），core 仍在 `co2`。
 
 ## 1. 目标与非目标
 
@@ -135,9 +135,8 @@ docs/
    2. 按 01 → 02 → 03 的顺序打上 `/workspace/coro-issues/0{1,2,3}-*/fix.patch`。
    3. 结果应与 `/workspace/coro-fix` @ `36b9fe0` 的树一致。
 2. 把 §3.2 列出的文件复制到 `include/awaitable/core/`。只做一种机械修改：把 `#include "co2/…"` 改成 `#include "awaitable/core/…"`。命名空间、宏名、代码内容都不变。
-3. 用 §3.3 标为“测试夹具”的文件建 `tests/legacy/include/co2/`。include 改写规则：
-   - 指向 core 文件（§3.2）的 `#include "co2/…"` 改成 `#include "awaitable/core/…"`；
-   - 指向夹具文件的保持 `co2/…`，由 `tests/legacy/include` 解析。
+3. 用 §3.3 标为“测试夹具”的文件建 `tests/legacy/include/co2/`，这些文件**不做任何改动**（include 仍写 `co2/…`）。对 §3.2 的每个 core 文件，在夹具的同名路径放一个一行的转发头（例如 `tests/legacy/include/co2/detail/frame.hpp` 只含 `#include "awaitable/core/detail/frame.hpp"`），夹具和测试源文件因此能原样编译。
+4. coro 的测试源文件（补丁后）原样复制到 `tests/legacy/`，同样不改。
 
 ### 3.2 搬入 core（原样）
 
@@ -205,7 +204,7 @@ private:
 
 - `T` 可以是 `void`、对象类型或左值引用。
 - 只能在同一 `Executor` 类型的 awaitable 帧里等待，对应 asio awaitable.hpp:64、107-129。
-- `Executor` 没有默认值，原因见 §16 Q4。库提供别名：
+- `Executor` 没有默认值，见已定决策 §16 D4。库提供别名：
 
 ```cpp
 template <class T = void> using pool_awaitable   = awaitable<T, thread_pool::executor_type>;
@@ -341,7 +340,7 @@ struct scheduler {
 };
 template <class Context> class basic_executor;      // executor_type 的通用实现，保存 Context*，非虚调用
 struct schedule_on_awaiter { scheduler* s; /* 原 ScheduleOn awaiter，只给 core 级协程用 */ };
-inline schedule_on_awaiter schedule_on(scheduler& s) noexcept;   // 原 scheduleOn，见 §16 Q3
+inline schedule_on_awaiter schedule_on(scheduler& s) noexcept;   // 原 scheduleOn，见 §16 D3
 }
 ```
 
@@ -810,7 +809,9 @@ auto consume() CO2_BEG(aw::awaitable<int, ex_t>, (), aw::async_generator<int, ex
 CO2_END
 ```
 
-`next()` 返回 `optional<T>`，这一点是已定决策。coro 现有的接口是 `bool` 加 `value()`，见 §16 Q5。
+`next()` 返回 `aw::optional<T>`（已定决策 §16 D5）。这是对 coro 接口的有意修改：coro 的 `CO2_AWAIT_SET(hasValue, g.next())` 返回 `bool`，再用 `value()` 取值；迁移时改成 `CO2_AWAIT_SET(v, g.next())`，用 `if (!v)` 判断结束，用 `*v` 取值。旧的 `bool` 加 `value()` 接口不保留。
+
+命名对照（已定决策 §16 D2）：coro 的 `AsyncGenerator` / `ThreadPool` / `ManualExecutor` / `Scheduler` / `syncWait` / `scheduleOn` 在新库里分别是 `aw::async_generator` / `aw::thread_pool` / `aw::manual_executor` / `aw::scheduler` / `aw::sync_wait` / `aw::schedule_on`。CamelCase 名字只存在于测试夹具 `tests/legacy/include/co2/`。
 
 ### 10.2 执行模型
 
@@ -925,8 +926,8 @@ asio 版本是 `190a8d8`。
   - 8 个契约违规测试，期望退出码 86：task_destroy、manual_executor、join_handle、generator_begin_twice、resume_running、thread_pool_zero_threads、async_generator_destroy、continuation_twice；
   - 2 个 compile-fail：await_inside_switch、member_macro_outside_member_function；
   - 1 个差分测试：differential，在 C++20 下构建。
-- **合计：** ctest 里 26 项，即 22 加 4 个新增 compile-fail，与 `/workspace/coro-fix` 一致。
-- **补丁 03 的回归：** 把 `/workspace/coro-issues/03-perf-alloc-sync/repro.cpp` 的分配计数逻辑改写成断言测试，对夹具编译，断言分配次数：syncWait 1、spawn 3、whenAll 5。计时部分留在基准里。新层的 `aw::sync_wait` 另外测“先完成后等待”和“先等待后完成”两种顺序（§14.3）。
+- **合计：** 22 加 4 个新增 compile-fail 共 26 项，与 `/workspace/coro-fix` 一致；再加下面的 03 回归测试，legacy 的 ctest 共 27 项。
+- **补丁 03 的回归：** 把 `/workspace/coro-issues/03-perf-alloc-sync/repro.cpp` 的分配计数逻辑改写成断言测试 `tests/legacy/issue03_allocation_counts_test.cpp`，对夹具编译，断言每次操作的分配次数：syncWait 1、syncWait(whenAll(2)) 5、spawn 3；并在 thread_pool 上跑一次“先等待后完成”的 syncWait。计时部分留在基准里。加上这一项，legacy 的 ctest 共 27 项（22 + 4 + 1）。新层的 `aw::sync_wait` 另外测“先完成后等待”和“先等待后完成”两种顺序（§14.3）。
 
 ### 14.2 原生差分测试（`tests/differential/`）
 
@@ -1005,28 +1006,28 @@ asio 版本是 `190a8d8`。
 2. **分配次数：** §15.1 的每一项都不多于 asio 的同一项。
 3. **耗时：** 等待子协程（单层和 1000 层）、异步桥接（同线程和跨线程）这两类的中位耗时，不超过 asio 同一项的 1.2 倍。
 4. **零分配：** 缓存打开后，在稳态下（每项预热 1000 次后测量），§0 定义的热路径中全局 `operator new` 的调用次数为 0。1000 层嵌套这一项只按第 2 条验收。
-5. **core 不变：** core 与 coro-fix `36b9fe0` 的对应文件相比，只有 include 路径不同（用脚本 diff 检查）。
+5. **core 不变：** core 与 coro-fix `36b9fe0` 的对应文件相比，只有 include 路径不同（用 `tools/verify-core-verbatim.sh` 把 include 路径还原后逐字节比较）；夹具与 legacy 测试源文件逐字节相同。
 
-## 16. 开放问题（每项都给出推荐答案）
+## 16. 已定决策（原开放问题，2026-11-12 用户确认按推荐答案）
 
-| # | 问题 | 推荐答案 |
+| # | 原问题 | 决策 |
 | --- | --- | --- |
-| Q1 | 新层用什么命名空间？ | 用 `aw`。如果用 `awaitable`，`awaitable::awaitable<T, E>` 读起来别扭，而且 `using namespace awaitable;` 之后 `awaitable` 这个名字会二义。仓库名、include 路径（`include/awaitable/…`）、总头文件（`<awaitable.hpp>`）不受影响。宏前缀用 `AW_`。core 仍在 `co2`。 |
-| Q2 | 保留的模块是否改名为 snake_case（`thread_pool`、`manual_executor`、`async_generator`、`scheduler`、`sync_wait`）？ | 改。新层整体采用 asio 的词汇和命名风格，和 `co_spawn`、`use_awaitable`、`cancellation_slot` 等保持一致。coro 的 CamelCase 名字只留在测试夹具里。本文已按这个方案书写。 |
-| Q3 | 原来的 `scheduleOn` 怎么处理？ | 保留为 `aw::schedule_on(scheduler&)`，返回 `schedule_on_awaiter`，只供 core 级协程使用。awaitable 帧里禁止等待它，换 executor 用 §7.3 第 6 条。 |
-| Q4 | `awaitable<T, Executor>` 的 Executor 要不要默认值？ | 不要。没有类型擦除就没有合适的默认值。提供 `pool_awaitable<T>`、`manual_awaitable<T>` 别名；strand 上的协程写 `awaitable<T, strand<E>>`。 |
-| Q5 | `async_generator::next()` 的返回类型。已定决策写的是返回 `optional<T>`，并称“对外接口保留”；但 coro 现有接口是 `CO2_AWAIT_SET(hasValue, g.next())` 返回 `bool`，再用 `value()` 取值（coro async_generator.hpp:15、180-181）。 | 按已定决策返回 `aw::optional<T>`，本文 §10 已这样写。这是对 coro 接口的有意修改，迁移时把 `hasValue` / `value()` 改成 `v` / `*v`。C++14 没有 `std::optional`，所以带上精简实现 `aw::optional`，C++17 及以上别名到 `std::optional`。不另外保留 `bool` 加 `value()` 的旧接口。**需要用户确认。** |
-| Q6 | coro 的 22 个测试大多依赖 Task / spawn / when_all / callback，而这些不搬进库。怎么跑？ | 用测试夹具（`tests/legacy/include/co2/`）：放补丁后的非 core 头文件，只供测试使用，不安装、不进总头文件。这样 22 个测试能原样证明 core 行为不变。新层的同类场景（spawn → co_spawn、when_all → `&&`、callback → `async_initiate`）在 `tests/unit/` 里另写。 |
-| Q7 | variant / optional 自己实现到什么程度？ | 只做 asio 运算符和 async_generator 需要的子集：`variant` 提供 `index()`、`get<I>`、`get_if<I>`、`in_place_index` 构造、`monostate`；`optional` 提供 `has_value`、`*`、`->`、`value()`、`reset`、`emplace`。C++17 及以上一律别名到 std 版本，所以 C++14 和 C++17 下的类型不同，只保证 API 子集一致。 |
-| Q8 | `co_spawn` 异常路径上的 `T` 不可默认构造时怎么办？ | 完成签名改为 `void(std::exception_ptr, aw::optional<T>)`（§8.4），只对这类 `T` 生效，可以默认构造的 `T` 保持 asio 的形式。 |
-| Q9 | 子协程异常要不要提供一个不多开入口帧的捕获包装（例如 `aw::catching(child())`，返回 `(exception_ptr, T)`）？ | v1 不做（YAGNI），先用 §7.4 的 `co_spawn(..., as_tuple(use_awaitable))` 写法。等基准显示这条路径成为瓶颈，再单独立项。 |
-| Q10 | stop_token 适配器要不要双向？ | 只做单向：取消转成 `request_stop`。反向会让同一次取消从两个来源进来，语义很难定义。 |
-| Q11 | 执行上下文析构时还有挂起的执行线程，怎么办？ | operation 项（包括被移动持有的执行线程）以“不执行”的方式销毁，帧栈立即内联展开；协程句柄项属于契约违规（§5.4 第 5 条）。与 asio 的 shutdown 语义一致。 |
-| Q12 | 回收缓存在非库线程（例如 `main` 里创建 awaitable）上不生效，会不会影响验收？ | 不影响。验收测的是稳态热路径，都在库线程上。`main` 里创建的第一个帧会走 new，之后在工作线程上释放时进入缓存。这一点与 asio 相同。 |
+| D1 | 新层用什么命名空间？ | 用 `aw`。如果用 `awaitable`，`awaitable::awaitable<T, E>` 读起来别扭，而且 `using namespace awaitable;` 之后 `awaitable` 这个名字会二义。仓库名、include 路径（`include/awaitable/…`）、总头文件（`<awaitable.hpp>`）不受影响。宏前缀用 `AW_`。core 仍在 `co2`。 |
+| D2 | 保留的模块是否改名为 snake_case（`thread_pool`、`manual_executor`、`async_generator`、`scheduler`、`sync_wait`）？ | 改。新层整体采用 asio 的词汇和命名风格，和 `co_spawn`、`use_awaitable`、`cancellation_slot` 等保持一致。coro 的 CamelCase 名字只留在测试夹具里。本文已按这个方案书写。 |
+| D3 | 原来的 `scheduleOn` 怎么处理？ | 保留为 `aw::schedule_on(scheduler&)`，返回 `schedule_on_awaiter`，只供 core 级协程使用。awaitable 帧里禁止等待它，换 executor 用 §7.3 第 6 条。 |
+| D4 | `awaitable<T, Executor>` 的 Executor 要不要默认值？ | 不要。没有类型擦除就没有合适的默认值。提供 `pool_awaitable<T>`、`manual_awaitable<T>` 别名；strand 上的协程写 `awaitable<T, strand<E>>`。 |
+| D5 | `async_generator::next()` 的返回类型。已定决策写的是返回 `optional<T>`，并称“对外接口保留”；但 coro 现有接口是 `CO2_AWAIT_SET(hasValue, g.next())` 返回 `bool`，再用 `value()` 取值（coro async_generator.hpp:15、180-181）。 | 返回 `aw::optional<T>`（§10.1）。这是对 coro 接口的有意修改，迁移时把 `hasValue` / `value()` 改成 `v` / `*v`。C++14 没有 `std::optional`，所以带上精简实现 `aw::optional`，C++17 及以上别名到 `std::optional`。不另外保留 `bool` 加 `value()` 的旧接口。 |
+| D6 | coro 的 22 个测试大多依赖 Task / spawn / when_all / callback，而这些不搬进库。怎么跑？ | 用测试夹具（`tests/legacy/include/co2/`）：放补丁后的非 core 头文件（原样）和指向 core 的一行转发头（§3.1），只供测试使用，不安装、不进总头文件。这样 22 个测试能原样证明 core 行为不变。新层的同类场景（spawn → co_spawn、when_all → `&&`、callback → `async_initiate`）在 `tests/unit/` 里另写。 |
+| D7 | variant / optional 自己实现到什么程度？ | 只做 asio 运算符和 async_generator 需要的子集：`variant` 提供 `index()`、`get<I>`、`get_if<I>`、`in_place_index` 构造、`monostate`；`optional` 提供 `has_value`、`*`、`->`、`value()`、`reset`、`emplace`。C++17 及以上一律别名到 std 版本，所以 C++14 和 C++17 下的类型不同，只保证 API 子集一致。 |
+| D8 | `co_spawn` 异常路径上的 `T` 不可默认构造时怎么办？ | 完成签名改为 `void(std::exception_ptr, aw::optional<T>)`（§8.4），只对这类 `T` 生效，可以默认构造的 `T` 保持 asio 的形式。 |
+| D9 | 子协程异常要不要提供一个不多开入口帧的捕获包装（例如 `aw::catching(child())`，返回 `(exception_ptr, T)`）？ | v1 不做（YAGNI），先用 §7.4 的 `co_spawn(..., as_tuple(use_awaitable))` 写法。等基准显示这条路径成为瓶颈，再单独立项。 |
+| D10 | stop_token 适配器要不要双向？ | 只做单向：取消转成 `request_stop`。反向会让同一次取消从两个来源进来，语义很难定义。 |
+| D11 | 执行上下文析构时还有挂起的执行线程，怎么办？ | operation 项（包括被移动持有的执行线程）以“不执行”的方式销毁，帧栈立即内联展开；协程句柄项属于契约违规（§5.4 第 5 条）。与 asio 的 shutdown 语义一致。 |
+| D12 | 回收缓存在非库线程（例如 `main` 里创建 awaitable）上不生效，会不会影响验收？ | 不影响。验收测的是稳态热路径，都在库线程上。`main` 里创建的第一个帧会走 new，之后在工作线程上释放时进入缓存。这一点与 asio 相同。 |
 
 ## 17. 自审记录
 
-1. **占位扫描：** 全文没有 TBD、TODO 或待定字样；每个开放问题都有推荐答案。
+1. **占位扫描：** 全文没有 TBD、TODO 或待定字样；§16 已全部定案。
 2. **一致性检查：**
    - `detached` 重抛（§7.2）、thread_pool terminate（§5.4）、§7.5 和对照表第 12、24 行一致。
    - 分配表（§9.3）与 `co_spawn`（§8.2）、验收（§15.4）一致。
@@ -1040,5 +1041,6 @@ asio 版本是 `190a8d8`。
      - §6.4 补上 `EnvStopToken` 的来源，以及 `getStopToken` / `inheritStopToken` 的移植与兼容名。
      - §3.1 补上夹具的 include 改写规则；§3.2 更正了 `move_only_function` 的用途。
      - 补上约定的两张时序图（§8.5：① 等待子协程，② 等待 use_awaitable 异步操作）。类型名和规则与 §4–§8 一致：`push_frame` / `pop_frame` 是帧的成员；executor 和取消状态放在入口帧里，由执行线程共享；同步完成时走 post 分支。两张图都用 mermaid 11 的解析器（`mermaid.parse`，在 jsdom 下运行）校验通过。
+   - 定案同步（2026-11-12）：§16 由“开放问题”改为“已定决策 D1–D12”；正文中引用 Q 的地方改为 D；§10.1 写明 `next()` 返回 `aw::optional<T>` 的迁移方式和 CamelCase→snake_case 命名对照；§3.1 改为“夹具与 legacy 测试原样，core 文件经转发头接入”，使原样校验覆盖夹具与测试；§14.1 补上 03 回归测试文件名，legacy ctest 合计 27 项；§15.4 第 5 条写明校验脚本。
 3. **范围：** 只覆盖一个库的 v1；core 的搬运作为实现计划的第一步。没有引入批准范围之外的功能：`deferred`、默认 token、捕获包装都被明确排除。
 4. **歧义消除：** “热路径”“库线程”在 §0 定义；“1.2 倍”指同一项的中位耗时；“分配次数不多于 asio”逐项比较；“core 原样”的可检查形式见 §15.4 第 5 条。
