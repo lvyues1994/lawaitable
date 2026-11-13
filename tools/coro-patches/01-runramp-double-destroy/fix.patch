@@ -1,0 +1,141 @@
+diff --git a/include/co2/detail/frame.hpp b/include/co2/detail/frame.hpp
+index ed2be8f..f8e88e7 100644
+--- a/include/co2/detail/frame.hpp
++++ b/include/co2/detail/frame.hpp
+@@ -13,6 +13,7 @@
+ #include "co2/detail/await_slot.hpp"
+ #include "co2/detail/awaitable.hpp"
+ #include "co2/detail/over_aligned.hpp"
++#include "co2/detail/uninitialized.hpp"
+ 
+ // 帧的恢复/收尾路径把状态机（Body::operator()）内联进来后，MSVC 会把 co_return 之后的
+ // 收尾判成不可达并报到本文件的行号上；C4702 以函数开括号处的状态为准，见 config.hpp。
+@@ -521,6 +522,8 @@ Return runRamp(CoroutineFrame<Promise, Params, Body, Allocator>& frame) {
+     using Core = FrameCore<Promise, Params, Body>;
+     auto& core = frame.core;
+ 
++    using Returned = typename std::decay<decltype(core.promise().get_return_object())>::type;
++
+     struct DestroyOnException {
+         FrameHeader* header;
+         ~DestroyOnException() {
+@@ -528,24 +531,37 @@ Return runRamp(CoroutineFrame<Promise, Params, Body, Allocator>& frame) {
+         }
+     } guard{&core.prefix.header};
+ 
+-    auto returned = core.promise().get_return_object();
++    // get_return_object 的结果放在原始存储里，只在"初始挂起点之前没有异常"时析构。
++    // 初始挂起点之前的异常由 guard 销毁协程状态；返回对象若拥有帧（常见写法），它的析构
++    // 会再销毁一次帧（双重销毁）。与 clang 的原生实现一致：此时返回对象不被析构。
++    struct ReturnedObject {
++        Uninitialized<Returned> storage;
++        bool settled = false; // 初始挂起点之前的阶段已无异常地结束
++        ~ReturnedObject() {
++            if (settled) storage.destroy();
++        }
++    } returned;
++    returned.storage.construct(core.promise().get_return_object());
++
+     auto& initial = core.slot.template emplace<typename Core::InitialAwaiter>(
+         getAwaiter(core.promise().initial_suspend()));
+     if (initial.await_ready()) {
+         guard.header = nullptr;
++        returned.settled = true;
+         core.handle()
+             .resume(); // 不挂起：直接进入 case 0（await_resume 之后是用户代码）
+-        return Return(std::move(returned));
++        return Return(std::move(returned.storage.get()));
+     }
+     auto const outcome = suspendWith(initial, core.handle());
+     guard.header = nullptr;
++    returned.settled = true;
+     if (not outcome.suspended) {
+         core.handle().resume();
+     } else if (outcome.next != nullptr) {
+         // 初始挂起点上的对称转移：驱动目标，本协程保持挂起。
+         coroutine_handle<>::from_address(outcome.next).resume();
+     }
+-    return Return(std::move(returned));
++    return Return(std::move(returned.storage.get()));
+ }
+ 
+ // 空指针检查只在 promise 提供 get_return_object_on_allocation_failure 时存在：没有它时
+diff --git a/tests/conformance_tests.cpp b/tests/conformance_tests.cpp
+index 40ee58f..39eaadf 100644
+--- a/tests/conformance_tests.cpp
++++ b/tests/conformance_tests.cpp
+@@ -256,6 +256,66 @@ void exceptionsBeforeTheInitialAwaitResumePropagateToTheCaller() {
+     }
+ }
+ 
++// 同上，但返回对象拥有帧（析构时 destroy()，Task 式的常见写法）：初始挂起点之前的异常
++// 只能销毁协程状态一次。修复前 runRamp 先析构返回对象（它销毁帧），guard 再销毁一次。
++struct OwningThrowingInitialTask {
++    struct promise_type {
++        EventLog* log{};
++        int throwAt{};
++        promise_type(EventLog& log_, int const throwAt_, Tracked&)
++            : log{&log_}, throwAt{throwAt_} {}
++        promise_type() = default;
++        ~promise_type() {
++            if (log != nullptr) log->add("promise destroyed");
++        }
++        OwningThrowingInitialTask get_return_object() {
++            return OwningThrowingInitialTask{
++                co2::coroutine_handle<promise_type>::from_promise(*this)};
++        }
++        T::Throwing initial_suspend() { return T::Throwing{log, throwAt}; }
++        co2::suspend_always final_suspend() noexcept { return {}; }
++        void return_void() {}
++        void unhandled_exception() { log->add("unhandled_exception"); }
++    };
++
++    explicit OwningThrowingInitialTask(co2::coroutine_handle<promise_type> h) : handle{h} {}
++    OwningThrowingInitialTask(OwningThrowingInitialTask&& other) noexcept
++        : handle{other.handle} {
++        other.handle = nullptr;
++    }
++    ~OwningThrowingInitialTask() {
++        if (handle) handle.destroy();
++    }
++
++    co2::coroutine_handle<promise_type> handle;
++};
++
++auto owningThrowsBeforeInitialResume(EventLog& log, int throwAt, Tracked param)
++    CO2_BEG(OwningThrowingInitialTask, (log, throwAt, param)) {
++    log.add("body");
++}
++CO2_END
++
++void exceptionsBeforeTheInitialAwaitResumeDestroyAnOwnedFrameOnce() {
++    // await_ready、await_suspend 抛出（get_return_object 已经返回了拥有帧的对象）。
++    for (auto const throwAt : {1, 2}) {
++        EventLog log;
++        auto propagated = false;
++        try {
++            owningThrowsBeforeInitialResume(log, throwAt, Tracked{log, "param"});
++        } catch (std::runtime_error const&) {
++            propagated = true;
++        }
++        CHECK(propagated);
++        checkDestroyedWithoutRunning(log);
++        auto destroyed = 0;
++        for (auto const& event : log.events) {
++            if (event == "promise destroyed") ++destroyed;
++        }
++        CHECK(destroyed == 1);
++    }
++}
++
+ // initial awaiter 的 await_resume 抛出不属于"初始挂起点之前"：标准在求值 await-resume
+ // 之前就把 initial-await-resume-called 置真（[dcl.fct.def.coroutine]/5），所以异常进入
+ // unhandled_exception，协程走到 final suspend，帧仍由拥有者销毁。
+@@ -1131,6 +1191,7 @@ int main() {
+     localsAreDestroyedBeforeUnhandledException();
+     rethrowingUnhandledExceptionLeavesTheCoroutineAtFinalSuspend();
+     exceptionsBeforeTheInitialAwaitResumePropagateToTheCaller();
++    exceptionsBeforeTheInitialAwaitResumeDestroyAnOwnedFrameOnce();
+     initialAwaitResumeExceptionsReachUnhandledException();
+     awaitSuspendReturningVoidSuspends();
+     readyAwaiterNeverSuspends();

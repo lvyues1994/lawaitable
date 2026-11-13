@@ -9,7 +9,11 @@ function(aw_configure_test target)
     target_compile_options(${target} PRIVATE
         -Wall -Wextra -Wpedantic -Werror -Wconversion -Wsign-conversion -Wnon-virtual-dtor
         -Wold-style-cast -Wzero-as-null-pointer-constant -Werror=return-type
-        -Werror=uninitialized -Werror=suggest-override -Werror=vla)
+        -Werror=uninitialized -Werror=suggest-override -Werror=vla
+        # GCC 在 -O2/-O3 深度内联后对 optional / variant 存储和协程帧局部量的 -Wmaybe-uninitialized
+        # 是已知的误报来源（Release 下 operators_test、async_generator_test 触发）；GCC 下保留警告、
+        # 不作为错误。-Werror=uninitialized（确定未初始化）不受影响。
+        $<$<CXX_COMPILER_ID:GNU>:-Wno-error=maybe-uninitialized>)
 endfunction()
 
 function(aw_test_target_name name out_var)

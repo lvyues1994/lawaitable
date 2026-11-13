@@ -1,0 +1,474 @@
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 5e43da4..585beb3 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -81,7 +81,8 @@ Allocator（只有带状态的 allocator 才在帧里留副本）
+ 
+ `CO2_BEG` 展开出参数副本类型、协程体类型（局部为成员，`operator()` 是 switch 状态机）
+ 与 ramp 调用；`CO2_AWAIT` 展开为标准的 `co_await` 序列：`await_transform`（若 promise
+-提供）→ `operator co_await` 查找（成员优先于 ADL；C++14 拼作 `operator_co_await`）→
++提供）→ `operator co_await` 查找（成员或 ADL 非成员，两者同时可行时编译报错；C++14 拼作
++`operator_co_await`）→
+ `await_ready` → `await_suspend`（按 `void` / `bool` / `coroutine_handle<Z>` 分派）→
+ `await_resume`。`CO2_YIELD(e)` ≡ `co_await promise.yield_value(e)`（不经过
+ `await_transform`），`CO2_RETURN` ≡ `return_void`/`return_value` + `co_await
+diff --git a/docs/design/coroutine-core-v2.md b/docs/design/coroutine-core-v2.md
+index 21a0445..10756ee 100644
+--- a/docs/design/coroutine-core-v2.md
++++ b/docs/design/coroutine-core-v2.md
+@@ -488,7 +488,7 @@ harden、trampoline 账本、每帧原子门闩、每次异步等待 1～2 次
+   帧的 awaiter 槽中，生命周期覆盖到恢复后的 `await_resume`——可观察行为相同。
+ - **D7 `operator co_await` 的拼写**：C++14 没有 `co_await` 关键字，成员/非成员
+   `operator co_await` 以 `operator_co_await` 拼写；C++20 构建下两种拼写都被查找，
+-  为 `std::` 写的 awaitable 无需改动。
++  为 `std::` 写的 awaitable 无需改动。成员与非成员同时可行时报错（见 D9）。
+ - **D8 右值 awaiter 必须可移动**：右值（纯右值、将亡值）awaiter 被移动进帧的 awaiter
+   槽——C++14 没有保证复制消除，纯右值无法直接落在帧里。C++17 起靠复制消除就能被原生
+   `co_await` 等待的不可移动纯右值（`co_await makeImmovable()`）在 co2 里编不过。
+@@ -499,7 +499,13 @@ harden、trampoline 账本、每帧原子门闩、每次异步等待 1～2 次
+ - **D9 宽松之处**：`await_transform` 只对能匹配的重载生效，匹配失败时原样等待
+   （标准：只要 promise 有 `await_transform`，不匹配就是编译错误）；`get_return_object`
+   的结果允许显式转换到返回类型；带协程参数的 `operator new(size, params...)` 重载
+-  暂不支持，只调用 `operator new(size)`。
++  暂不支持，只调用 `operator new(size)`——promise 声明了 `operator new` 却没有
++  `operator new(size)` 时是编译错误（早先会悄悄改用 allocator）。标准判为病式的以下
++  promise / awaitable 同样在编译期报错（`detail::checkPromiseRequirements`、
++  `detail::getAwaiter`）：`co_await promise.final_suspend()` 可能抛出；promise 作用域里
++  `return_void` 与 `return_value` 都有声明；成员与非成员 `operator co_await` 同时可行
++  （co2 无法让两者进入同一次重载决议，所以只要同时可行就报错——比标准略严：标准下其中
++  一个严格更优时可以通过）。
+ - **D10 awaitable 表达式里的临时对象**：标准里 `co_await e` 整个全表达式的临时对象
+   活到恢复之后（编译器把它们放进帧）；这里 `e` 在生成的 `if` 条件里求值，临时对象在
+   调用 `await_suspend` 之前就已销毁，**只有 awaiter 本身**被放进帧。因此 awaiter 不能
+diff --git a/include/co2/detail/awaitable.hpp b/include/co2/detail/awaitable.hpp
+index e8a7722..8816084 100644
+--- a/include/co2/detail/awaitable.hpp
++++ b/include/co2/detail/awaitable.hpp
+@@ -26,40 +26,79 @@ template <int N> struct Rank : Rank<N - 1> {};
+ template <> struct Rank<0> {};
+ 
+ template <class Awaitable>
+-auto toAwaiter(Awaitable&& awaitable, Rank<4>)
++auto toAwaiter(Awaitable&& awaitable, Rank<4>) noexcept(
++    noexcept(std::forward<Awaitable>(awaitable).operator_co_await()))
+     -> decltype(std::forward<Awaitable>(awaitable).operator_co_await()) {
+     return std::forward<Awaitable>(awaitable).operator_co_await();
+ }
+ 
+ template <class Awaitable>
+-auto toAwaiter(Awaitable&& awaitable, Rank<3>)
++auto toAwaiter(Awaitable&& awaitable, Rank<3>) noexcept(
++    noexcept(operator_co_await(std::forward<Awaitable>(awaitable))))
+     -> decltype(operator_co_await(std::forward<Awaitable>(awaitable))) {
+     return operator_co_await(std::forward<Awaitable>(awaitable));
+ }
+ 
+ #if defined(__cpp_impl_coroutine)
+ template <class Awaitable>
+-auto toAwaiter(Awaitable&& awaitable, Rank<2>)
++auto toAwaiter(Awaitable&& awaitable, Rank<2>) noexcept(
++    noexcept(std::forward<Awaitable>(awaitable).operator co_await()))
+     -> decltype(std::forward<Awaitable>(awaitable).operator co_await()) {
+     return std::forward<Awaitable>(awaitable).operator co_await();
+ }
+ 
+ template <class Awaitable>
+-auto toAwaiter(Awaitable&& awaitable, Rank<1>)
++auto toAwaiter(Awaitable&& awaitable, Rank<1>) noexcept(
++    noexcept(operator co_await(std::forward<Awaitable>(awaitable))))
+     -> decltype(operator co_await(std::forward<Awaitable>(awaitable))) {
+     return operator co_await(std::forward<Awaitable>(awaitable));
+ }
+ #endif
+ 
+-template <class Awaitable> Awaitable&& toAwaiter(Awaitable&& awaitable, Rank<0>) {
++template <class Awaitable>
++Awaitable&& toAwaiter(Awaitable&& awaitable, Rank<0>) noexcept {
+     return std::forward<Awaitable>(awaitable);
+ }
+ 
+-// awaitable → awaiter。查找顺序与标准一致：成员 operator co_await，非成员
+-// operator co_await，否则 awaitable 本身就是 awaiter。
++// 成员与非成员 operator co_await 是否可行（任一拼写）。标准把两者放进同一个重载决议，
++// 同时可行时通常二义（[over.match.oper]）；co2 无法把两种形式放进同一次重载决议，所以
++// 两者同时可行时直接报错，而不是悄悄选成员。这比标准略严：标准下其中一个严格更优
++// （例如引用限定不同）时可以通过。
++template <class Awaitable> struct CoAwaitCandidates {
++    template <class A>
++    static auto member(Rank<1>) -> decltype(std::declval<A>().operator_co_await(), std::true_type{});
++#if defined(__cpp_impl_coroutine)
++    template <class A>
++    static auto member(Rank<0>) -> decltype(std::declval<A>().operator co_await(), std::true_type{});
++#else
++    template <class A> static std::false_type member(Rank<0>);
++#endif
++    template <class> static std::false_type member(...);
++
++    template <class A>
++    static auto free(Rank<1>) -> decltype(operator_co_await(std::declval<A>()), std::true_type{});
++#if defined(__cpp_impl_coroutine)
++    template <class A>
++    static auto free(Rank<0>) -> decltype(operator co_await(std::declval<A>()), std::true_type{});
++#else
++    template <class A> static std::false_type free(Rank<0>);
++#endif
++    template <class> static std::false_type free(...);
++
++    static constexpr bool hasMember = decltype(member<Awaitable>(Rank<1>{}))::value;
++    static constexpr bool hasFree = decltype(free<Awaitable>(Rank<1>{}))::value;
++};
++
++// awaitable → awaiter。查找顺序：成员 operator co_await，非成员 operator co_await，
++// 否则 awaitable 本身就是 awaiter；成员与非成员同时可行时报错（见上）。
+ template <class Awaitable>
+-auto getAwaiter(Awaitable&& awaitable)
++auto getAwaiter(Awaitable&& awaitable) noexcept(
++    noexcept(toAwaiter(std::forward<Awaitable>(awaitable), Rank<4>{})))
+     -> decltype(toAwaiter(std::forward<Awaitable>(awaitable), Rank<4>{})) {
++    static_assert(not(CoAwaitCandidates<Awaitable&&>::hasMember &&
++                      CoAwaitCandidates<Awaitable&&>::hasFree),
++                  "co2: both a member and a non-member operator co_await are viable for "
++                  "this awaitable; the standard makes this ambiguous ([over.match.oper])");
+     return toAwaiter(std::forward<Awaitable>(awaitable), Rank<4>{});
+ }
+ 
+diff --git a/include/co2/detail/frame.hpp b/include/co2/detail/frame.hpp
+index f8e88e7..07e3a1d 100644
+--- a/include/co2/detail/frame.hpp
++++ b/include/co2/detail/frame.hpp
+@@ -224,6 +224,33 @@ template <class Promise> struct HasPromiseOperatorNew {
+     static constexpr bool value = decltype(probe<Promise>(0))::value;
+ };
+ 
++// 任何形式的 promise 类内 operator new（含 operator new(size_t, 参数...)）。借助名字查找
++// 二义性探测：派生类同时继承 promise 与一个自带 operator new 的探针基类，promise 只要
++// 声明了 operator new，派生类里的查找就二义、表达式无效。
++struct OperatorNewProbe {
++    static void* operator new(std::size_t, OperatorNewProbe*) noexcept;
++};
++template <class Promise> struct OperatorNewProbeDerived : Promise, OperatorNewProbe {};
++
++template <class Promise, bool Inheritable> struct HasAnyPromiseOperatorNewImpl {
++    template <class D>
++    static auto probe(int) -> decltype(D::operator new (std::size_t{},
++                                                        static_cast<OperatorNewProbe*>(nullptr)),
++                                       std::false_type{});
++    template <class> static std::true_type probe(long);
++    static constexpr bool value =
++        decltype(probe<OperatorNewProbeDerived<Promise>>(0))::value;
++};
++template <class Promise> struct HasAnyPromiseOperatorNewImpl<Promise, false> {
++    static constexpr bool value = false;
++};
++template <class Promise>
++struct HasAnyPromiseOperatorNew
++    : std::integral_constant<
++          bool, HasAnyPromiseOperatorNewImpl<
++                    Promise, std::is_class<Promise>::value &&
++                                 not std::is_final<Promise>::value>::value> {};
++
+ template <class Promise>
+ auto promiseAllocate(std::size_t const size, int)
+     -> decltype(Promise::operator new(size)) {
+@@ -255,6 +282,68 @@ template <class Promise> struct HasAllocationFailureObject {
+     static constexpr bool value = decltype(probe<Promise>(0))::value;
+ };
+ 
++// ---- 标准判为病式、co2 曾默默接受的 promise（设计稿 D9） ----
++
++// [dcl.fct.def.coroutine]/6 按名字判断：在 promise 类型的作用域里查找 return_void 与
++// return_value，两者都找到任何声明（哪怕是被 SFINAE 禁用的模板）即为病式。探测同样借助
++// 名字查找二义性：派生类同时继承 promise 与声明了该名字的探针基类。
++struct ReturnProbeTag {};
++struct ReturnValueProbe {
++    void return_value(ReturnProbeTag);
++};
++struct ReturnVoidProbe {
++    void return_void(ReturnProbeTag);
++};
++template <class Promise, class Probe> struct ReturnProbeDerived : Promise, Probe {};
++
++template <class Promise, class Probe, bool Inheritable> struct DeclaresReturnNameImpl {
++    template <class D> static auto probe(int, ReturnValueProbe*)
++        -> decltype(std::declval<D&>().return_value(ReturnProbeTag{}), std::false_type{});
++    template <class D> static auto probe(int, ReturnVoidProbe*)
++        -> decltype(std::declval<D&>().return_void(ReturnProbeTag{}), std::false_type{});
++    template <class> static std::true_type probe(long, ...);
++    static constexpr bool value = decltype(probe<ReturnProbeDerived<Promise, Probe>>(
++        0, static_cast<Probe*>(nullptr)))::value;
++};
++template <class Promise, class Probe> struct DeclaresReturnNameImpl<Promise, Probe, false> {
++    static constexpr bool value = false;
++};
++template <class Promise, class Probe>
++struct DeclaresReturnName
++    : std::integral_constant<
++          bool, DeclaresReturnNameImpl<Promise, Probe,
++                                       std::is_class<Promise>::value &&
++                                           not std::is_final<Promise>::value>::value> {};
++
++// co_await promise.final_suspend() 整个表达式不得潜在抛出（[dcl.fct.def.coroutine]/15）。
++template <class Promise> struct FinalSuspendIsNoexcept {
++    using Expression = decltype(getAwaiter(std::declval<Promise&>().final_suspend()));
++    using Stored = AwaiterOf<decltype(std::declval<Promise&>().final_suspend())>;
++    static constexpr bool value =
++        noexcept(getAwaiter(std::declval<Promise&>().final_suspend())) &&
++        std::is_nothrow_constructible<Stored, Expression>::value &&
++        noexcept(std::declval<Expression&>().await_ready()) &&
++        noexcept(std::declval<Expression&>().await_suspend(
++            std::declval<coroutine_handle<Promise>>())) &&
++        noexcept(std::declval<Expression&>().await_resume());
++};
++
++template <class Promise> void checkPromiseRequirements() noexcept {
++    static_assert(not(HasAnyPromiseOperatorNew<Promise>::value &&
++                      not HasPromiseOperatorNew<Promise>::value),
++                  "co2: the promise declares operator new but not operator new(std::size_t); "
++                  "co2 cannot pass the coroutine parameters to operator new (design D9), "
++                  "so provide operator new(std::size_t) or use an allocator parameter");
++    static_assert(not(DeclaresReturnName<Promise, ReturnVoidProbe>::value &&
++                      DeclaresReturnName<Promise, ReturnValueProbe>::value),
++                  "co2: a promise type must not declare both return_void and return_value "
++                  "([dcl.fct.def.coroutine]/6)");
++    static_assert(FinalSuspendIsNoexcept<Promise>::value,
++                  "co2: co_await promise.final_suspend() must not be potentially-throwing "
++                  "([dcl.fct.def.coroutine]/15): mark final_suspend and the final awaiter's "
++                  "await_ready / await_suspend / await_resume noexcept");
++}
++
+ // 帧的原始内存：来源是 promise 的 operator new（若有）或 allocator。
+ //
+ // 帧的对齐不超过 alignof(std::max_align_t) 时按帧类型分配一个对象。超对齐的帧（局部或
+@@ -521,6 +610,7 @@ template <class Return, class Promise, class Params, class Body, class Allocator
+ Return runRamp(CoroutineFrame<Promise, Params, Body, Allocator>& frame) {
+     using Core = FrameCore<Promise, Params, Body>;
+     auto& core = frame.core;
++    checkPromiseRequirements<Promise>();
+ 
+     using Returned = typename std::decay<decltype(core.promise().get_return_object())>::type;
+ 
+diff --git a/include/co2/task.hpp b/include/co2/task.hpp
+index 4aada83..946d8d0 100644
+--- a/include/co2/task.hpp
++++ b/include/co2/task.hpp
+@@ -33,7 +33,21 @@ namespace detail {
+ 
+ struct TaskAccess;
+ 
+-template <class T> struct TaskPromise {
++template <class T> struct TaskPromise;
++
++// return_value / return_void 只能声明其一：标准按名字查找判断，两者都能找到声明（哪怕是被
++// enable_if 禁用的成员模板）即为病式（[dcl.fct.def.coroutine]/6），所以放在按 T 特化的基类里。
++template <class T> struct TaskReturn {
++    template <class Value> void return_value(Value&& value) {
++        static_cast<TaskPromise<T>*>(this)->storage.emplace(std::forward<Value>(value));
++    }
++};
++
++template <> struct TaskReturn<void> {
++    void return_void() noexcept; // TaskPromise<void> 完整之后定义
++};
++
++template <class T> struct TaskPromise : TaskReturn<T> {
+     // 声明构造函数是为了让它不是聚合类型。聚合在 C++20 起可以用圆括号初始化，"能用参数
+     // 副本构造 promise 就传入"的规则会因此拿协程的第一个参数去初始化 continuation。
+     TaskPromise() = default;
+@@ -56,18 +70,6 @@ template <class T> struct TaskPromise {
+ 
+     FinalAwaiter final_suspend() noexcept { return {}; }
+ 
+-    template <class Value, class U = T,
+-              class = typename std::enable_if<not std::is_void<U>::value>::type>
+-    void return_value(Value&& value) {
+-        storage.emplace(std::forward<Value>(value));
+-    }
+-
+-    template <class U = T,
+-              class = typename std::enable_if<std::is_void<U>::value>::type>
+-    void return_void() noexcept {
+-        storage.emplace();
+-    }
+-
+     void unhandled_exception() noexcept { error = std::current_exception(); }
+ 
+     // ---- 环境 ----
+@@ -102,6 +104,10 @@ template <class T> struct TaskPromise {
+     bool started{};
+ };
+ 
++inline void TaskReturn<void>::return_void() noexcept {
++    static_cast<TaskPromise<void>*>(this)->storage.emplace();
++}
++
+ // 等待一个 Task：记下等待者，对称转移进 Task；Task 完成时 FinalAwaiter 转移回来。
+ // 它不拥有帧——拥有者是 Task 对象（右值等待时 Task 本身就在 awaiter 槽里）。
+ template <class T> struct TaskAwaiter {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 1dad38f..684e2f2 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -90,7 +90,11 @@ endforeach()
+ # 宏的对照目标随正常构建一起编译，证明失败只来自被测的那一处，而不是别的笔误。
+ set(co2_compile_fail_test_sources
+     await_inside_switch_compile_fail_test.cpp
+-    member_macro_outside_member_function_compile_fail_test.cpp)
++    member_macro_outside_member_function_compile_fail_test.cpp
++    promise_operator_new_with_params_compile_fail_test.cpp
++    final_suspend_not_noexcept_compile_fail_test.cpp
++    return_void_and_return_value_compile_fail_test.cpp
++    ambiguous_operator_co_await_compile_fail_test.cpp)
+ 
+ foreach(co2_test_source IN LISTS co2_compile_fail_test_sources)
+     co2_test_target_name("${co2_test_source}" co2_test_target)
+diff --git a/tests/ambiguous_operator_co_await_compile_fail_test.cpp b/tests/ambiguous_operator_co_await_compile_fail_test.cpp
+new file mode 100644
+index 0000000..f9dbf18
+--- /dev/null
++++ b/tests/ambiguous_operator_co_await_compile_fail_test.cpp
+@@ -0,0 +1,32 @@
++// 编译失败测试：成员与非成员 operator co_await 同时可行时报错。
++//
++// 标准把两者放进同一次重载决议，此处二义（[over.match.oper]）。修复前 co2 悄悄选成员。
++//
++// 定义 CO2_EXPECT_COMPILE_FAILURE 时本文件必须编不过；不定义时是对照，必须能编过。
++
++#include "co2/task.hpp"
++
++namespace sample {
++
++struct ReadyAwaiter {
++    bool await_ready() const noexcept { return true; }
++    void await_suspend(co2::coroutine_handle<>) const noexcept {}
++    int await_resume() const noexcept { return value; }
++    int value;
++};
++
++struct Wrapped {
++    ReadyAwaiter operator_co_await() const noexcept { return ReadyAwaiter{1}; }
++};
++
++#ifdef CO2_EXPECT_COMPILE_FAILURE
++inline ReadyAwaiter operator_co_await(Wrapped) noexcept { return ReadyAwaiter{2}; }
++#endif
++
++} // namespace sample
++
++auto awaitWrapped() CO2_BEG(co2::Task<int>, (), int value{};) {
++    CO2_AWAIT_SET(value, sample::Wrapped{});
++    CO2_RETURN(value);
++}
++CO2_END
+diff --git a/tests/final_suspend_not_noexcept_compile_fail_test.cpp b/tests/final_suspend_not_noexcept_compile_fail_test.cpp
+new file mode 100644
+index 0000000..fb87ae7
+--- /dev/null
++++ b/tests/final_suspend_not_noexcept_compile_fail_test.cpp
+@@ -0,0 +1,27 @@
++// 编译失败测试：co_await promise.final_suspend() 可能抛出时报错。
++//
++// 标准要求整个表达式不得潜在抛出（[dcl.fct.def.coroutine]/15）。co2 的 final suspend 在
++// noexcept 函数里执行，修复前非 noexcept 的 final_suspend 能编过，一旦抛出就 terminate。
++//
++// 定义 CO2_EXPECT_COMPILE_FAILURE 时本文件必须编不过；不定义时是对照，必须能编过。
++
++#include "co2/coroutine.hpp"
++
++#ifdef CO2_EXPECT_COMPILE_FAILURE
++#define CO2_TEST_FINAL_NOEXCEPT
++#else
++#define CO2_TEST_FINAL_NOEXCEPT noexcept
++#endif
++
++struct EagerTask {
++    struct promise_type {
++        EagerTask get_return_object() noexcept { return {}; }
++        co2::suspend_never initial_suspend() noexcept { return {}; }
++        co2::suspend_never final_suspend() CO2_TEST_FINAL_NOEXCEPT { return {}; }
++        void return_void() noexcept {}
++        void unhandled_exception() noexcept {}
++    };
++};
++
++auto eager() CO2_BEG(EagerTask, ()) { CO2_RETURN(); }
++CO2_END
+diff --git a/tests/promise_operator_new_with_params_compile_fail_test.cpp b/tests/promise_operator_new_with_params_compile_fail_test.cpp
+new file mode 100644
+index 0000000..862bdc6
+--- /dev/null
++++ b/tests/promise_operator_new_with_params_compile_fail_test.cpp
+@@ -0,0 +1,44 @@
++// 编译失败测试：promise 只提供 operator new(size_t, 参数...) 时报错。
++//
++// 标准先尝试 operator new(size, 参数左值...)（[dcl.fct.def.coroutine]/9），co2 先分配帧再把
++// 参数移进去，无法传参（设计稿 D9）。修复前 co2 会悄悄改用 allocator，promise 的
++// operator new 一次也不被调用；现在是编译错误。
++//
++// 定义 CO2_EXPECT_COMPILE_FAILURE 时本文件必须编不过；不定义时是对照，必须能编过。
++
++#include <cstddef>
++#include <cstdlib>
++#include <new>
++
++#include "co2/coroutine.hpp"
++
++struct AllocatingTask {
++    struct promise_type {
++#ifdef CO2_EXPECT_COMPILE_FAILURE
++        static void* operator new(std::size_t size, int) {
++            void* const memory = std::malloc(size);
++            if (memory == nullptr) throw std::bad_alloc{};
++            return memory;
++        }
++#else
++        static void* operator new(std::size_t size) {
++            void* const memory = std::malloc(size);
++            if (memory == nullptr) throw std::bad_alloc{};
++            return memory;
++        }
++#endif
++        static void operator delete(void* const memory) noexcept { std::free(memory); }
++
++        AllocatingTask get_return_object() noexcept { return {}; }
++        co2::suspend_never initial_suspend() noexcept { return {}; }
++        co2::suspend_never final_suspend() noexcept { return {}; }
++        void return_void() noexcept {}
++        void unhandled_exception() noexcept {}
++    };
++};
++
++auto allocating(int value) CO2_BEG(AllocatingTask, (value)) {
++    static_cast<void>(value);
++    CO2_RETURN();
++}
++CO2_END
+diff --git a/tests/return_void_and_return_value_compile_fail_test.cpp b/tests/return_void_and_return_value_compile_fail_test.cpp
+new file mode 100644
+index 0000000..d846d57
+--- /dev/null
++++ b/tests/return_void_and_return_value_compile_fail_test.cpp
+@@ -0,0 +1,24 @@
++// 编译失败测试：promise 同时声明 return_void 与 return_value 时报错。
++//
++// 标准按名字查找判断，两者都找到声明即为病式（[dcl.fct.def.coroutine]/6）。修复前 co2
++// 照常编过（co2::Task<void> 的 promise 自己就同时声明了两者，现已拆到按 T 特化的基类）。
++//
++// 定义 CO2_EXPECT_COMPILE_FAILURE 时本文件必须编不过；不定义时是对照，必须能编过。
++
++#include "co2/coroutine.hpp"
++
++struct EagerTask {
++    struct promise_type {
++        EagerTask get_return_object() noexcept { return {}; }
++        co2::suspend_never initial_suspend() noexcept { return {}; }
++        co2::suspend_never final_suspend() noexcept { return {}; }
++        void return_void() noexcept {}
++#ifdef CO2_EXPECT_COMPILE_FAILURE
++        void return_value(int) noexcept {}
++#endif
++        void unhandled_exception() noexcept {}
++    };
++};
++
++auto eager() CO2_BEG(EagerTask, ()) { CO2_RETURN(); }
++CO2_END

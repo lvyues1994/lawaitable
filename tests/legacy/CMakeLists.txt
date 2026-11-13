@@ -14,6 +14,13 @@ set(CO2_TEST_CXX_STANDARD ${AW_TEST_CXX_STANDARD} CACHE STRING
 
 add_subdirectory(tests)
 
+# GCC 14 -O2 对 core/detail/over_aligned.hpp 的 placeOverAligned 误报 -Warray-bounds
+# （它假设 std::align 可能返回空指针；这里的 space 留足了填充，不会失败）。core 与 legacy 测试
+# 都须逐字节保持原样，所以只在 GCC 下把这一条从错误降回警告，仅限触发它的这个测试。
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(co2-conformance-tests PRIVATE -Wno-error=array-bounds)
+endif()
+
 # 问题 03 的回归：分配次数断言（规格 §14.1）。
 add_executable(co2-issue03-allocation-counts-test issue03_allocation_counts_test.cpp)
 co2_configure_test_target(co2-issue03-allocation-counts-test)

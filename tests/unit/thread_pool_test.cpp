@@ -1,5 +1,6 @@
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -132,7 +133,7 @@ void spinFollowsAvailableCpus() {
     CPU_ZERO(&original);
     AW_CHECK(sched_getaffinity(0, sizeof original, &original) == 0);
     AW_CHECK(aw::detail::cpus_available_to_this_thread() == static_cast<unsigned>(CPU_COUNT(&original)));
-    int first = 0;
+    std::size_t first = 0;
     while (!CPU_ISSET(first, &original)) ++first;
     cpu_set_t one;
     CPU_ZERO(&one);

@@ -1,0 +1,141 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      benchmarks:
+        description: "同时跑基准（tools/run-benchmarks.sh + check-acceptance.py，只报告、不做门禁）"
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # coro 0be5ab2：core 逐字节校验的基线（再叠加 tools/coro-patches/ 下的 01/02/03 补丁）
+  CORO_COMMIT: 0be5ab2f1b72be3755d8d13fb02d4bf32f652539
+  # asio 1.39.0（190a8d8）：tests/asio_parity 与 asio 基准的对照组
+  ASIO_COMMIT: 190a8d8daf1cc62909b4e0c72ff491ba264ca98e
+
+jobs:
+  verbatim:
+    name: core verbatim check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout coro
+        uses: actions/checkout@v4
+        with:
+          repository: lvyues1994/coro
+          ref: ${{ env.CORO_COMMIT }}
+          path: _deps/coro
+      - name: Verify core / fixtures / legacy tests are verbatim
+        env:
+          CORO_REPO: ${{ github.workspace }}/_deps/coro
+        run: tools/verify-core-verbatim.sh
+
+  test:
+    # 每个配置都包含：单元/契约/legacy/差分/asio 对照/压力测试；头文件自包含检查（ctest 的
+    # aw-header-self-containment，以及随 Build 编译的 co2-header-self-containment-tests）；
+    # compile-fail 测试（ctest 的 aw-*-compile-fail-test 与 co2-*-compile-fail-test）。
+    name: ${{ matrix.compiler }} / ${{ matrix.preset }} / C++${{ matrix.std }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc-14, clang-18]
+        preset: [debug, release, asan, tsan]
+        std: [14, 17, 20]
+        include:
+          - compiler: gcc-14
+            cxx: g++-14
+          - compiler: clang-18
+            cxx: clang++-18
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout asio
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: ${{ env.ASIO_COMMIT }}
+          path: _deps/asio
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build g++-14 clang-18 libclang-rt-18-dev
+          cmake --version
+          "$CXX" --version
+      - name: Allow sanitizer shadow mappings
+        if: matrix.preset == 'asan' || matrix.preset == 'tsan'
+        # 新内核的 ASLR 熵过高时 TSan/ASan 运行时会因映射冲突崩溃
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.compiler }}-${{ matrix.preset }}-cxx${{ matrix.std }}
+          max-size: 200M
+      - name: Configure
+        run: >
+          cmake --preset ${{ matrix.preset }}
+          -DAW_TEST_CXX_STANDARD=${{ matrix.std }}
+          -DAW_ASIO_ROOT="$GITHUB_WORKSPACE/_deps/asio"
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - name: Test
+        run: ctest --preset ${{ matrix.preset }} --parallel 4 --timeout 300
+
+  benchmarks:
+    # 只在手动触发且勾选时运行；结果作为 artifact 上传，验收检查只打印、不让 job 失败（共享 runner 噪声大）。
+    name: benchmarks (manual, non-gating)
+    if: github.event_name == 'workflow_dispatch' && inputs.benchmarks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout asio
+        uses: actions/checkout@v4
+        with:
+          repository: chriskohlhoff/asio
+          ref: ${{ env.ASIO_COMMIT }}
+          path: _deps/asio
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build clang-18
+      - name: Run benchmarks
+        env:
+          AW_CXX: clang++-18
+          AW_ASIO_ROOT: ${{ github.workspace }}/_deps/asio
+          AW_BENCH_CPU: "1"
+        run: |
+          md=$(tools/run-benchmarks.sh | tail -n 1)
+          echo "AW_BENCH_MD=$md" >> "$GITHUB_ENV"
+      - name: Acceptance report (non-gating)
+        run: |
+          {
+            echo '## Benchmarks'
+            echo
+            tail -n 20 "$AW_BENCH_MD"
+            echo
+            echo '## check-acceptance.py'
+            echo
+            echo '```'
+            python3 tools/check-acceptance.py "${AW_BENCH_MD%.md}.json" || echo "(acceptance check failed: exit $?, not gating)"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmarks
+          path: |
+            benchmarks/results/
+            build/bench/raw/

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # 用法：tools/patched-coro.sh <输出目录>
-# 在 <输出目录> 生成 coro 0be5ab2 + /workspace/coro-issues 补丁 01→02→03 的源码树。
+# 在 <输出目录> 生成 coro 0be5ab2 + 补丁 01→02→03 的源码树。
+# 补丁默认取仓库内 tools/coro-patches/（与 /workspace/coro-issues/*/fix.patch 逐字节相同）；
+# CORO_REPO 需含提交 0be5ab2（github.com/lvyues1994/coro）。
 set -euo pipefail
 out=$1
 CORO_REPO=${CORO_REPO:-/workspace/coro}
-CORO_ISSUES=${CORO_ISSUES:-/workspace/coro-issues}
+CORO_ISSUES=${CORO_ISSUES:-$(cd "$(dirname "$0")" && pwd)/coro-patches}
 CORO_COMMIT=0be5ab2
 rm -rf "$out"
 mkdir -p "$out"

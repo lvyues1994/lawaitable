@@ -1,0 +1,259 @@
+diff --git a/benchmarks/co2_benchmarks.cpp b/benchmarks/co2_benchmarks.cpp
+index 3acd321..496a9b0 100644
+--- a/benchmarks/co2_benchmarks.cpp
++++ b/benchmarks/co2_benchmarks.cpp
+@@ -14,6 +14,7 @@
+ #include <exception>
+ #include <string>
+ #include <thread>
++#include <tuple>
+ #include <utility>
+ #include <vector>
+ 
+@@ -145,6 +146,23 @@ double syncWaitReadyTask() {
+     });
+ }
+ 
++// whenAll 两个同步完成的子 Task：两个子帧 + awaiter（超出 awaiter 槽时在堆上）+ stop 状态。
++auto awaitsWhenAll(int n)
++    CO2_BEG(co2::Task<long>, (n), int i{}; long total{}; std::tuple<int, int> pair{};) {
++    for (i = 0; i < n; ++i) {
++        CO2_AWAIT_SET(pair, co2::whenAll(leaf(i), leaf(i)));
++        total += std::get<0>(pair) + std::get<1>(pair);
++    }
++    CO2_RETURN(total);
++}
++CO2_END
++
++double whenAllTwoReadyTasks() {
++    constexpr int ops = 2000000;
++    return nanosecondsPerOp(static_cast<std::size_t>(ops),
++                            [&] { sink = co2::syncWait(awaitsWhenAll(ops)); });
++}
++
+ // 多个线程各自跑一条"等待子 Task"的循环。sharedToken 为真时所有线程的 Task 树共用同一个
+ // stop_token——whenAll / spawn 的各个分支落在不同线程上时就是这种形态。
+ double awaitChildOnThreads(int const threads, bool const sharedToken) {
+@@ -211,6 +229,22 @@ double threadPoolHopSaturated() { return threadPoolHops(4U, 32, 100000); }
+ // 不饱和：一个 Task 在 8 个工作线程的池里反复让步，其余 7 个线程无事可做。
+ double threadPoolHopUnsaturated() { return threadPoolHops(8U, 1, 1000000); }
+ 
++// 同线程的 spawn + join：没有跨线程唤醒，剩下的是 spawn 自身的开销（帧、JoinState、
++// stop 状态三次分配与 JoinState 的锁）。
++double spawnAndJoinManualExecutor() {
++    constexpr int ops = 1000000;
++    co2::ManualExecutor executor;
++    return nanosecondsPerOp(static_cast<std::size_t>(ops), [&] {
++        long total = 0;
++        for (auto index = 0; index != ops; ++index) {
++            auto handle = co2::spawn(executor, leaf(index));
++            executor.run();
++            total += handle.join();
++        }
++        sink = total;
++    });
++}
++
+ double spawnAndJoin() {
+     constexpr int ops = 20000;
+     co2::ThreadPool pool{1U};
+@@ -236,6 +270,8 @@ Benchmark const benchmarks[] = {
+     {"ThreadPool hop (1 worker, 1 task)", &threadPoolHopOneWorker},
+     {"ThreadPool hop (4 workers, 32 tasks)", &threadPoolHopSaturated},
+     {"ThreadPool hop (8 workers, 1 task, unsaturated)", &threadPoolHopUnsaturated},
++    {"whenAll(2 ready Tasks)", &whenAllTwoReadyTasks},
++    {"spawn + join (ManualExecutor, same thread)", &spawnAndJoinManualExecutor},
+     {"spawn + join (cross-thread wakeup)", &spawnAndJoin},
+ };
+ 
+diff --git a/include/co2/spawn.hpp b/include/co2/spawn.hpp
+index f83ca23..d616922 100644
+--- a/include/co2/spawn.hpp
++++ b/include/co2/spawn.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <memory>
+ #include <mutex>
+@@ -64,7 +65,10 @@ struct JoinState {
+     std::condition_variable completed;
+     coroutine_handle<> waiter;
+     coroutine_handle<> detachedFrame;
+-    bool ready{};
++    bool ready{}; // 受 mutex 保护
++    // ready 的无锁副本（锁内以 release 写入）：join() 在 Task 已完成时不必拿锁。释放
++    // state 的一方（reset）仍然先拿锁，所以完成方放开锁之前 state 不会被销毁。
++    std::atomic<bool> readyHint{false};
+     bool detached{};
+     stop_source source;
+     // stop_callback 不可移动，用 LateInit（与 WhenAllState 一致）而不是 ResultStorage：
+@@ -82,6 +86,7 @@ inline FrameHeader* JoinCompletion::complete(FrameHeader* const header) {
+         // 在锁内通知：JoinHandle 一旦看到 ready 就可能释放 state。
+         std::lock_guard<std::mutex> lock{state->mutex};
+         state->ready = true;
++        state->readyHint.store(true, std::memory_order_release);
+         waiter = state->waiter;
+         state->waiter = nullptr;
+         destroyNow = state->detached;
+@@ -162,7 +167,7 @@ template <class T> struct JoinHandle {
+     // 的工作线程上调用会占住该线程。
+     T join() {
+         CO2_CONTRACT_CHECK(state != nullptr);
+-        {
++        if (not state->readyHint.load(std::memory_order_acquire)) {
+             std::unique_lock<std::mutex> lock{state->mutex};
+             state->completed.wait(lock, [this] { return state->ready; });
+         }
+@@ -192,11 +197,17 @@ template <class T> struct JoinHandle {
+ 
+     void reset() noexcept {
+         if (state == nullptr) return;
+-        // Task 还没完成才请求停止——已经完成就没有可停止的东西。请求必须在锁外：回调可能
+-        // 同步把 Task 推到完成，而 complete() 需要拿这把锁。
+-        if (not isReady()) state->source.request_stop();
++        // 已完成（最常见：join 之后析构）时只拿一次锁：完成方在锁内置 ready，等它放开
++        // 锁之后才能释放 state。
+         auto destroyNow = false;
+         {
++            std::lock_guard<std::mutex> lock{state->mutex};
++            destroyNow = state->ready;
++        }
++        if (not destroyNow) {
++            // Task 还没完成才请求停止——已经完成就没有可停止的东西。请求必须在锁外：回调
++            // 可能同步把 Task 推到完成，而 complete() 需要拿这把锁。
++            state->source.request_stop();
+             std::lock_guard<std::mutex> lock{state->mutex};
+             // 借用本 handle 的等待者还挂着：销毁 handle 会让它恢复时访问已销毁的对象。
+             CO2_CONTRACT_CHECK(not state->waiter);
+diff --git a/include/co2/sync_wait.hpp b/include/co2/sync_wait.hpp
+index 955b6e2..0f4f9c1 100644
+--- a/include/co2/sync_wait.hpp
++++ b/include/co2/sync_wait.hpp
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <mutex>
+ #include <type_traits>
+@@ -14,22 +15,36 @@
+ namespace co2 {
+ namespace detail {
+ 
++// 完成与等待的握手。快路径：Task 在 start() 里同步完成（或在等待线程开始等待之前完成）时，
++// 双方只各做一次原子操作，不碰 mutex / condition_variable。慢路径：等待线程先在锁内把
++// 状态从 running 改成 parked 再睡；完成方看到 parked 才拿锁通知。
+ struct SyncWaitState {
++    enum : unsigned char { running, finished, parked };
++
++    std::atomic<unsigned char> phase{running};
+     std::mutex mutex;
+     std::condition_variable wakeup;
+-    bool finished{};
++    bool notified{}; // 慢路径的谓词，受 mutex 保护
+ 
+     void markFinished() noexcept {
+-        // 在锁内通知：state 住在 syncWait 的栈上，等待线程一旦看到 finished
+-        // 就会销毁它。
++        if (phase.exchange(finished, std::memory_order_acq_rel) != parked) return;
++        // 在锁内通知：state 住在 syncWait 的栈上，等待线程一旦看到 notified
++        // 就会销毁它。等待线程只认锁内写的 notified，不认 phase，所以不会在这里
++        // 还没放开锁时提前返回。
+         std::lock_guard<std::mutex> lock{mutex};
+-        finished = true;
++        notified = true;
+         wakeup.notify_one();
+     }
+ 
+     void wait() {
++        if (phase.load(std::memory_order_acquire) == finished) return;
+         std::unique_lock<std::mutex> lock{mutex};
+-        wakeup.wait(lock, [this] { return finished; });
++        auto expected = static_cast<unsigned char>(running);
++        if (not phase.compare_exchange_strong(expected, parked,
++                                              std::memory_order_acq_rel,
++                                              std::memory_order_acquire))
++            return; // 期间已经完成：完成方没有看到 parked，不会再碰 mutex
++        wakeup.wait(lock, [this] { return notified; });
+     }
+ };
+ 
+diff --git a/include/co2/task.hpp b/include/co2/task.hpp
+index 946d8d0..8acf20b 100644
+--- a/include/co2/task.hpp
++++ b/include/co2/task.hpp
+@@ -225,6 +225,20 @@ struct TaskAccess {
+         return task.handle;
+     }
+ 
++    // 同上，但只借用 `token` 的停止状态，不碰引用计数。调用方保证 `token` 活过 Task 的
++    // 运行（whenAll：token 在 awaiter 里，child 全部完成之后 awaiter 才销毁）。
++    template <class T>
++    static coroutine_handle<> armBorrowing(Task<T>& task,
++                                           coroutine_handle<> const continuation,
++                                           EnvStopToken const& token) noexcept {
++        CO2_CONTRACT_CHECK(task.handle && not task.handle.promise().started);
++        auto& promise = task.handle.promise();
++        promise.continuation = continuation;
++        promise.stopToken.borrow(token);
++        promise.started = true;
++        return task.handle;
++    }
++
+     template <class T> static bool isDone(Task<T> const& task) noexcept {
+         return task.handle && task.handle.done();
+     }
+diff --git a/include/co2/when_all.hpp b/include/co2/when_all.hpp
+index 05c579d..ffeee50 100644
+--- a/include/co2/when_all.hpp
++++ b/include/co2/when_all.hpp
+@@ -28,7 +28,9 @@
+ // 实现：awaiter 自身就是操作状态。每个 child 一个内嵌的手写续体帧（标准布局，不占堆），
+ // child 的 FinalAwaiter 对称转移到它；计数初值 N+1，启动方最后放下自己的一份——
+ // 全部 child 同步完成时 await_suspend 返回 false 不挂起，否则最后到达的 child 把等待者
+-// 作为对称转移目标恢复。tuple 版本除 child 帧与 stop 状态外零分配。
++// 作为对称转移目标恢复。分配：每个 child 帧一次、stop 状态一次；awaiter 本身超出等待者
++// 的 awaiter 槽（默认 64 字节；WhenAllTuple<int> 已有 168 字节）时，槽再回落到堆上分配
++// 一次。
+ 
+ namespace co2 {
+ namespace detail {
+@@ -51,6 +53,7 @@ struct WhenAllState {
+                std::size_t const count) {
+         awaiting = awaiting_;
+         remaining.store(count + 1U, std::memory_order_relaxed);
++        childToken.own(source.get_token());
+         if (parent.stop_possible())
+             forwarding.emplace(std::move(parent), ForwardStop{&source});
+     }
+@@ -81,6 +84,9 @@ struct WhenAllState {
+     std::atomic<std::size_t> firstFailure{noFailure};
+     coroutine_handle<> awaiting;
+     stop_source source;
++    // child 借用它（不碰引用计数）：它与 source 一起活到 awaiter 销毁，而 child 全部
++    // 完成之后 awaiter 才会销毁；child 若复制出 stop_token，复制品自己持有引用。
++    EnvStopToken childToken;
+     LateInit<stop_callback<ForwardStop>> forwarding; // 晚于 source 构造、先于它析构
+ };
+ 
+@@ -117,7 +123,7 @@ void startWhenAllChild(WhenAllChild& child, WhenAllState& state, Task<T>& task,
+     child =
+         WhenAllChild{FrameHeader{&noopDestroy, &WhenAllChild::complete, false, false},
+                      &state, &task, &whenAllTaskFailed<T>, index};
+-    TaskAccess::arm(task, child.handle(), state.source.get_token()).resume();
++    TaskAccess::armBorrowing(task, child.handle(), state.childToken).resume();
+ }
+ 
+ // ---- 结果类型：值通道拼接 ----
+@@ -198,7 +204,8 @@ template <class... T> struct WhenAllTuple {
+ 
+     std::tuple<Task<T>...> tasks;
+     WhenAllState state;
+-    std::array<WhenAllChild, count> children; // 启动时填充
++    // 启动时填充；值初始化，免得默认移动构造（启动前移进等待者的帧）复制不确定值。
++    std::array<WhenAllChild, count> children{};
+ };
+ 
+ template <class T> struct WhenAllRangeResult { using type = std::vector<T>; };

@@ -50,14 +50,21 @@ class allocation_counter {
 } // namespace aw_test
 
 #if !defined(AW_TEST_NO_COUNTING_NEW)
-void* operator new(std::size_t size) {
+// GCC 14 -O2 把替换的 operator new / delete 内联成 malloc / free 后，会把配对的调用误报成
+// -Wmismatched-new-delete；不让它们内联即可（计数测试不关心这里的速度）。
+#if defined(__GNUC__) && !defined(__clang__)
+#define AW_TEST_COUNTING_NEW_NOINLINE __attribute__((noinline))
+#else
+#define AW_TEST_COUNTING_NEW_NOINLINE
+#endif
+AW_TEST_COUNTING_NEW_NOINLINE void* operator new(std::size_t size) {
     aw_test::new_calls().fetch_add(1, std::memory_order_relaxed);
     if (void* const p = std::malloc(size == 0U ? 1U : size)) return p;
     throw std::bad_alloc{};
 }
-void operator delete(void* p) noexcept {
+AW_TEST_COUNTING_NEW_NOINLINE void operator delete(void* p) noexcept {
     if (p != nullptr) aw_test::delete_calls().fetch_add(1, std::memory_order_relaxed);
     std::free(p);
 }
-void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
+AW_TEST_COUNTING_NEW_NOINLINE void operator delete(void* p, std::size_t) noexcept { ::operator delete(p); }
 #endif
