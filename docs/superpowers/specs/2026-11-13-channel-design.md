@@ -164,3 +164,24 @@ if (std::get<0>(r) == aw::channel_errc::channel_closed) ...                     
 
 `channel_ping_pong`：同一 executor 上一个发送协程、一个接收协程，容量 1，每次往返的耗时与分配次数，
 与 asio `experimental::channel<void(error_code, int)>` 对比。结果写进 `benchmarks/results/`，不进验收。
+
+## C10. CI 修正（2026-11-13）
+
+GitHub CI 的 TSan（GCC 14 / Clang 18 + libstdc++）在 `channel_test` 的 `use_future` 错误路径报竞争：池线程析构 `std::promise`
+时释放异常对象的最后一个引用，而 libstdc++ 的异常引用计数在未插桩的 `libstdc++.so` 里，TSan 看不到它与主线程 `catch`
+之间的同步，属于误报（只用 `std::promise` + `std::thread` 的最小程序同样会报，GCC 14 / Clang 18 各 20/20）。之前本地矩阵
+用的是 zig c++（libc++ 随程序一起按 TSan 插桩编译），所以没复现。CI 同款工具链（TSan、C++17）修改前各跑 100 轮：单核
+（`taskset -c 0`）`channel_test` 96%、`sync_wait_test` 98%～100%；双核 `channel_test` 1%～4%、`sync_wait_test` 0%；
+4 核、8 核都是 0%。CI 上 ctest 同时跑 4 个测试抢 CPU，相当于少核，所以偶发。修改后单核、多核都是 0%。
+
+- 测试：错误路径改为在独立线程池上做，`get()` 前先销毁（join）线程池。`use_future` 的 promise 在投递线程上析构是
+  `std::promise` 的固有行为，库无法消除。
+- 库：`co_spawn` 入口帧交付异常时会在投递线程上残留一份 `exception_ptr`（`sync_wait_test` 在 libstdc++ TSan 单核下
+  98%～100% 报同类竞争）。新增 `detail::take_exception` / `detail::exception_handoff`（`impl/awaitable_frame.hpp`）：交出后
+  源对象一定置空（先内联判空，没有异常时不多调库函数）。不能只写 `std::move`：LLVM 20 及以前的 libc++（含 NDK r25c、QNX SDP 7.1）`exception_ptr` 没有移动
+  构造，`std::move` 退化成复制，被移走的 `deliver_op` 仍持有引用。`entry_point.hpp` 的 `deliver_op` / `deliver_void_op`、
+  `sync_wait` 的回调、`parallel_group` 的子任务回调都改用它。
+- 回归测试：`awaitable_test` 的 `spawnHandsTheExceptionOverByMove`（回调丢掉异常后异常对象立即析构；旧实现在 libstdc++
+  和 LLVM 20 libc++ 下都失败）与 `exceptionHandoffEmptiesTheSource`。
+- 验收补充：频道与跨线程改动须在 CI 同款工具链（GCC 14、Clang 18 + libstdc++）的 24 个配置上跑通，TSan 下相关测试单核与
+  多核各 200 轮（C++17；C++14 / C++20 各 50 轮）。

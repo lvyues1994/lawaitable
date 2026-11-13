@@ -37,16 +37,18 @@ template <class T> struct spawn_result {
     }
 };
 
+// 异常交给回调后入口帧和被移走的 op 都不留副本（exception_handoff）：否则副本可能在投递线程上晚于消费方释放异常对象，
+// 而 libstdc++ 的异常引用计数在未插桩的 .so 里，TSan 会把这次释放报成数据竞争。
 template <class Handler, class V> struct deliver_op {
     Handler handler;
-    std::exception_ptr e;
+    exception_handoff e;
     V v;
-    void operator()() { handler(e, std::move(v)); }
+    void operator()() { handler(e.take(), std::move(v)); }
 };
 template <class Handler> struct deliver_void_op {
     Handler handler;
-    std::exception_ptr e;
-    void operator()() { handler(e); }
+    exception_handoff e;
+    void operator()() { handler(e.take()); }
 };
 
 // §8.2：token 带关联 slot 时的取消桥。slot 处理器和入口帧各持一个引用；处理器可能在
@@ -237,7 +239,7 @@ class entry_frame_impl final : public entry_frame_base<Executor>, private Storag
             }
         } // 用户帧在交付前归还缓存
         using op_type = deliver_op<Handler, spawn_value_t<T>>;
-        dispatch_to_handler(op_type{std::move(handler_), e, result.take()});
+        dispatch_to_handler(op_type{std::move(handler_), exception_handoff{take_exception(e)}, result.take()});
     }
 
     void deliver(std::true_type) {
@@ -250,7 +252,7 @@ class entry_frame_impl final : public entry_frame_base<Executor>, private Storag
                 e = std::current_exception();
             }
         }
-        dispatch_to_handler(deliver_void_op<Handler>{std::move(handler_), e});
+        dispatch_to_handler(deliver_void_op<Handler>{std::move(handler_), exception_handoff{take_exception(e)}});
     }
 
     // §7.3 第 5 条：交付到 token 的关联 executor；回调抛出的异常经 pump 的 complete 重抛。

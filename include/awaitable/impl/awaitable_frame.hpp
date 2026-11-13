@@ -50,6 +50,34 @@ template <class T, class Executor> struct is_awaitable_of : std::false_type {};
 template <class U, class Executor>
 struct is_awaitable_of<awaitable<U, Executor>, Executor> : std::true_type {};
 
+// 交出 exception_ptr，原处不留引用。老版本 libc++（LLVM 20 及以前、NDK r25c、QNX SDP 7.1）的
+// exception_ptr 没有移动构造 / 移动赋值，std::move 会退化成复制，原对象仍持有引用；这里复制后显式置空。
+// 返回的纯右值直接初始化接收方（形参 / 成员），不会再多出副本。没有异常是常态：先做内联的判空，
+// 免得在 libc++ 上为空指针多调两次不内联的复制 / 赋值（co_spawn 每次交付都会经过这里）。
+inline std::exception_ptr take_exception(std::exception_ptr& e) noexcept {
+    if (!e) return std::exception_ptr{};
+    std::exception_ptr out = std::move(e);
+    e = nullptr;
+    return out;
+}
+
+// 投递用的异常槽：移动时源对象一定置空（见 take_exception）。装进 operation 的结构体移动时，
+// 被移走的那份不会在投递线程上继续持有异常引用。
+class exception_handoff {
+  public:
+    exception_handoff() = default;
+    explicit exception_handoff(std::exception_ptr e) noexcept : e_(take_exception(e)) {}
+    exception_handoff(exception_handoff&& other) noexcept : e_(take_exception(other.e_)) {}
+    exception_handoff& operator=(exception_handoff&& other) noexcept {
+        e_ = take_exception(other.e_);
+        return *this;
+    }
+    std::exception_ptr take() noexcept { return take_exception(e_); }
+
+  private:
+    std::exception_ptr e_;
+};
+
 // 帧里待重抛的异常。std::exception_ptr 的析构在 libc++ / libstdc++ 里是不内联的库调用，
 // 即使为空也要调一次；绝大多数帧没有异常，所以放进 union，只在非空时才析构（判空是内联
 // 的指针比较）。大小与 std::exception_ptr 相同，帧布局不变（§9.1）。

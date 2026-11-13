@@ -77,7 +77,7 @@ template <> struct sync_wait_state<void> {
 template <class T> struct sync_wait_handler {
     sync_wait_state<T>* state;
     template <class V> void operator()(std::exception_ptr e, V&& v) {
-        state->error = std::move(e);
+        state->error = take_exception(e); // 不在投递线程上留引用
         if (!state->error) state->value.emplace(std::forward<V>(v));
         state->event.set(); // 之后不再访问 state
     }
@@ -85,7 +85,7 @@ template <class T> struct sync_wait_handler {
 template <> struct sync_wait_handler<void> {
     sync_wait_state<void>* state;
     void operator()(std::exception_ptr e) {
-        state->error = std::move(e);
+        state->error = take_exception(e); // 不在投递线程上留引用
         state->event.set();
     }
 };

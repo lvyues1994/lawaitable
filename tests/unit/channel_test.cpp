@@ -491,8 +491,19 @@ void use_future_token() {
     std::future<int> received = ch.async_receive(aw::use_future);
     sent.get();
     AW_CHECK(received.get() == 1);
-    ch.close();
-    std::future<int> after = ch.async_receive(aw::use_future);
+
+    // 错误路径：use_future 交付的是装着 system_error 的 exception_ptr。池线程在 set_exception 之后
+    // 才析构 promise，可能比主线程的 catch 晚，于是由池线程释放异常对象。libstdc++ 的异常引用计数在
+    // 未插桩的 libstdc++.so 里，TSan 看不到这条 happens-before，会把 catch 里读 e.code() 与池线程的
+    // free 报成数据竞争（误报；纯 std::promise / std::thread 也能复现）。先销毁线程池（join）再 get，
+    // 让池线程的全部动作 happens-before 主线程读异常，测试在任何标准库下都无竞争。
+    std::future<int> after;
+    {
+        aw::thread_pool closing_pool{1};
+        aw::channel<int, aw::thread_pool::executor_type> closed{closing_pool, 0};
+        closed.close();
+        after = closed.async_receive(aw::use_future);
+    }
     bool threw = false;
     try {
         static_cast<void>(after.get());

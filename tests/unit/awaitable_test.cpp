@@ -244,6 +244,69 @@ void runsOnThreadPool() {
 }
 
 // 验收修订第 3 项：帧里的待重抛异常只在真有异常时才持有 std::exception_ptr。
+// 入口帧把异常交给回调，自己和被移走的 deliver_op 都不留副本：回调丢掉 exception_ptr 时异常对象立即析构。
+// 否则残留的副本会在别的线程上、晚于消费方释放异常对象（libstdc++ 下 TSan 会把它报成竞争）。
+// 老版本 libc++（LLVM 20）的 exception_ptr 没有移动构造，std::move 会退化成复制，这条测试在那里同样要过。
+struct counted_error : std::exception {
+    static int& live() noexcept {
+        static int n = 0;
+        return n;
+    }
+    counted_error() noexcept { ++live(); }
+    counted_error(counted_error const&) noexcept : std::exception{} { ++live(); }
+    ~counted_error() override { --live(); }
+    char const* what() const noexcept override { return "counted"; }
+};
+
+auto throws_counted() CO2_BEG(task<int>, ()) {
+    throw counted_error{};
+}
+CO2_END
+
+auto throws_counted_void() CO2_BEG(task<void>, ()) {
+    throw counted_error{};
+}
+CO2_END
+
+void spawnHandsTheExceptionOverByMove() {
+    aw::manual_executor ctx;
+    int live_after_drop = -1;
+    aw::co_spawn(ctx, throws_counted(), [&](std::exception_ptr e, int) {
+        AW_CHECK(e && counted_error::live() >= 1);
+        e = nullptr;
+        live_after_drop = counted_error::live();
+    });
+    ctx.run();
+    AW_CHECK(live_after_drop == 0);
+    live_after_drop = -1;
+    aw::co_spawn(ctx, throws_counted_void(), [&](std::exception_ptr e) {
+        AW_CHECK(e);
+        e = nullptr;
+        live_after_drop = counted_error::live();
+    });
+    ctx.run();
+    AW_CHECK(live_after_drop == 0);
+    AW_CHECK(counted_error::live() == 0);
+}
+
+void exceptionHandoffEmptiesTheSource() {
+    {
+        std::exception_ptr raw = std::make_exception_ptr(counted_error{});
+        aw::detail::exception_handoff a{aw::detail::take_exception(raw)};
+        AW_CHECK(!raw);
+        aw::detail::exception_handoff b{std::move(a)};
+        AW_CHECK(!a.take());
+        aw::detail::exception_handoff c;
+        c = std::move(b);
+        AW_CHECK(!b.take());
+        std::exception_ptr e = c.take();
+        AW_CHECK(e && !c.take() && counted_error::live() == 1);
+        e = nullptr;
+        AW_CHECK(counted_error::live() == 0);
+    }
+    AW_CHECK(counted_error::live() == 0);
+}
+
 void pendingExceptionHoldsOnlyRealExceptions() {
     aw::detail::pending_exception p;
     AW_CHECK(!p);
@@ -283,5 +346,7 @@ int main() {
     childFramesReuseRecycledMemory();
     runsOnThreadPool();
     pendingExceptionHoldsOnlyRealExceptions();
+    spawnHandsTheExceptionOverByMove();
+    exceptionHandoffEmptiesTheSource();
     return 0;
 }

@@ -125,7 +125,7 @@ template <class Executor, class T, class U, class Handler> class pair_group_stat
     template <unsigned I, class V> struct child_done {
         pair_group_state* self;
         template <class... Vs> void operator()(std::exception_ptr e, Vs&&... v) {
-            self->store(std::integral_constant<unsigned, I>{}, std::move(e), std::forward<Vs>(v)...);
+            self->store(std::integral_constant<unsigned, I>{}, take_exception(e), std::forward<Vs>(v)...);
             self->decide(I, I == 0U ? !!self->outcome_.e0 : !!self->outcome_.e1);
             self->finish_one();
         }
@@ -143,14 +143,14 @@ template <class Executor, class T, class U, class Handler> class pair_group_stat
         ex_.dispatch(launch_op<Executor>{std::move(thread)});
     }
 
-    void store(std::integral_constant<unsigned, 0U>, std::exception_ptr e) { outcome_.e0 = std::move(e); }
-    void store(std::integral_constant<unsigned, 1U>, std::exception_ptr e) { outcome_.e1 = std::move(e); }
+    void store(std::integral_constant<unsigned, 0U>, std::exception_ptr e) { outcome_.e0 = take_exception(e); }
+    void store(std::integral_constant<unsigned, 1U>, std::exception_ptr e) { outcome_.e1 = take_exception(e); }
     template <class V> void store(std::integral_constant<unsigned, 0U>, std::exception_ptr e, V&& v) {
-        outcome_.e0 = std::move(e);
+        outcome_.e0 = take_exception(e);
         if (!outcome_.e0) outcome_.v0.emplace(std::forward<V>(v));
     }
     template <class V> void store(std::integral_constant<unsigned, 1U>, std::exception_ptr e, V&& v) {
-        outcome_.e1 = std::move(e);
+        outcome_.e1 = take_exception(e);
         if (!outcome_.e1) outcome_.v1.emplace(std::forward<V>(v));
     }
 

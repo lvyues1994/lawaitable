@@ -62,6 +62,14 @@ CO2_END
 | Android arm64-v8a / x86_64 | NDK r25c（Clang 14 + libc++，`android-24` 起） | 库与全部测试交叉编译通过（C++14/17/20）；CI 有 arm64 交叉编译 job |
 | QNX 7.1 aarch64le / x86_64 | SDP 7.1 的 qcc / q++（GCC 8.3 + LLVM libc++） | 用 qcc 交叉编译库与全部测试通过：aarch64le Release C++14/17/20 + Debug C++17，x86_64 Release C++17；需要 QNX 许可证，不进 CI |
 
+TSan 与 libstdc++：libstdc++ 的 `exception_ptr` 引用计数在未插桩的 `libstdc++.so` 里，TSan 看不到它的 happens-before。
+别的线程释放异常对象的最后一个引用（例如 `std::promise` 在池线程上析构）时，即使 `future::get()` 已经正确同步，TSan 也可能误报
+数据竞争。libc++ 从源码插桩构建时没有这个问题。库内部交付异常（`co_spawn` 回调、`sync_wait`、`||`/`&&`）
+用 `take_exception` / `exception_handoff` 交出 `exception_ptr`，不在投递线程上残留引用（老版本 libc++ 的
+`exception_ptr` 没有移动构造，`std::move` 会退化成复制，所以不能只靠 `std::move`）。`use_future` 的 `std::promise`
+在完成后才于投递线程上析构，这是 `std::promise` 本身的行为，库无法避免；测试里跨线程的 `use_future` 错误路径会先
+join 线程池再 `get()`。
+
 交叉编译只构建库和测试可执行文件，测试要拷到目标机上运行（ctest 不会在主机上执行它们）。
 
 ```sh
