@@ -137,7 +137,9 @@ template <class Executor> class strand {
         : inner_{std::move(inner)}, impl_{std::make_shared<detail::strand_impl>()} {}
 
     Executor const& get_inner_executor() const noexcept { return inner_; }
-    auto& context() const noexcept { return inner_.context(); }
+    // 显式写出返回类型：GCC 8（QNX 7.1）在 is_executor 的 SFINAE 里推导 auto& 返回类型会失败，
+    // 使 co_spawn(strand, ...) 找不到重载。
+    decltype(std::declval<Executor const&>().context()) context() const noexcept { return inner_.context(); }
 
     template <class F> void post(F&& f) const {
         enqueue(detail::make_function_operation(std::forward<F>(f)));

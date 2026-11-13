@@ -234,7 +234,9 @@ template <class Executor> class awaitable_frame_base {
         if (e->throw_if_cancelled_ && !!e->cancellation_state_.cancelled()) throw_cancelled();
     }
     AW_DETAIL_NOINLINE static void throw_cancelled() {
-        throw std::system_error{std::error_code{error::operation_aborted}, "co_await"};
+        // 直接调 make_error_code，不走 std::error_code 的枚举构造函数：GCC 8 + libc++（QNX 7.1）
+        // 会把那个构造函数的默认实参 `= 0` 在这里报成 -Wzero-as-null-pointer-constant。
+        throw std::system_error{error::make_error_code(error::operation_aborted), "co_await"};
     }
 
     // ---- 数据成员（asio :523-528）----

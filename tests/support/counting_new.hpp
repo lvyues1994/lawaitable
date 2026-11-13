@@ -51,8 +51,9 @@ class allocation_counter {
 
 #if !defined(AW_TEST_NO_COUNTING_NEW)
 // GCC 14 -O2 把替换的 operator new / delete 内联成 malloc / free 后，会把配对的调用误报成
-// -Wmismatched-new-delete；不让它们内联即可（计数测试不关心这里的速度）。
-#if defined(__GNUC__) && !defined(__clang__)
+// -Wmismatched-new-delete；不让它们内联即可（计数测试不关心这里的速度）。该告警从 GCC 11 才有；
+// GCC 8（QNX 7.1 + libc++）反而会对 noinline 报 -Wattributes，所以只对 GCC 11+ 加。
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
 #define AW_TEST_COUNTING_NEW_NOINLINE __attribute__((noinline))
 #else
 #define AW_TEST_COUNTING_NEW_NOINLINE

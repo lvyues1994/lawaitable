@@ -1,6 +1,30 @@
 # 新层测试的公共设置：与 coro 相同的告警集；C++ 标准取 AW_TEST_CXX_STANDARD。
 set(AW_TESTS_DIR ${CMAKE_CURRENT_LIST_DIR})
 
+# 差分测试与 asio 对照测试用同一编译器的原生 C++20 协程作对照，需要标准库提供 <coroutine>。
+# 编译器声称支持 C++20 不代表有 <coroutine>：GCC 8（QNX 7.1）没有，NDK r25c 的 libc++ 只有
+# <experimental/coroutine>。没有时跳过这些测试（库本身不依赖 <coroutine>）。
+include(CheckCXXSourceCompiles)
+if(NOT DEFINED AW_HAVE_STD_COROUTINE)
+    set(CMAKE_REQUIRED_FLAGS "${CMAKE_CXX20_STANDARD_COMPILE_OPTION}")
+    check_cxx_source_compiles([[
+#include <coroutine>
+int main() { std::coroutine_handle<> h{}; return h ? 1 : 0; }
+]] AW_HAVE_STD_COROUTINE)
+    unset(CMAKE_REQUIRED_FLAGS)
+endif()
+if(NOT AW_HAVE_STD_COROUTINE)
+    message(STATUS "<coroutine> unavailable: differential and asio parity tests skipped")
+endif()
+
+# GCC 8 + libc++（QNX 7.1）：libc++ 头文件里的默认实参 `= 0`（如 std::error_code 的构造函数）
+# 在实例化点触发 -Wzero-as-null-pointer-constant；legacy 的 allocation_tests.cpp 用了 GCC 8
+# 还不认识的 -Wmismatched-new-delete，触发 -Wpragmas。这两条在 GCC 8 下只保留为警告。
+# 用目录级选项，使原样搬入的 legacy 测试也受影响。
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    add_compile_options(-Wno-error=zero-as-null-pointer-constant -Wno-error=pragmas)
+endif()
+
 function(aw_configure_test target)
     target_link_libraries(${target} PRIVATE awaitable::awaitable)
     target_include_directories(${target} PRIVATE ${AW_TESTS_DIR}/support)

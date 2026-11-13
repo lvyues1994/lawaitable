@@ -12,6 +12,12 @@ target_link_libraries(awaitable_legacy_fixture INTERFACE awaitable::awaitable)
 set(CO2_TEST_CXX_STANDARD ${AW_TEST_CXX_STANDARD} CACHE STRING
     "C++ standard used to build the co2 tests" FORCE)
 
+# 原样的 tests/CMakeLists.txt 只凭 cxx_std_20 是否在 CMAKE_CXX_COMPILE_FEATURES 里决定是否构建
+# 与原生协程对照的 differential_tests.cpp。没有 <coroutine> 时（GCC 8 / NDK r25c 的 libc++），
+# 在本目录作用域里把 cxx_std_20 从该列表去掉（只影响这个子目录，不改原样文件）。
+if(NOT AW_HAVE_STD_COROUTINE)
+    list(REMOVE_ITEM CMAKE_CXX_COMPILE_FEATURES cxx_std_20)
+endif()
 add_subdirectory(tests)
 
 # GCC 14 -O2 对 core/detail/over_aligned.hpp 的 placeOverAligned 误报 -Warray-bounds

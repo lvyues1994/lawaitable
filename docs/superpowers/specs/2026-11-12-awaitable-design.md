@@ -370,7 +370,7 @@ inline schedule_on_awaiter schedule_on(scheduler& s) noexcept;   // 原 schedule
    1. 停止接收新任务，唤醒并 join 全部工作线程。
    2. 排空所有队列：`operation` 以 `invoke=false` 销毁；销毁过程中新投递的项同样立即销毁。
    3. 队列里如果还有协程句柄项，属于契约违规（沿用 coro `ManualExecutor` 的销毁契约）。
-6. **自旋感知核数（2026-11-13 验收修订）：** 工作线程启动时用 `detail::cpus_available_to_this_thread()` 读取自己的 CPU 亲和性（Linux 上是 `sched_getaffinity`，其他平台退回 `hardware_concurrency`）。只有 1 个 CPU 时（`detail::pause_spin_useful` 为假），停车前的搜索跳过 pause 自旋，直接进入让出时间片的轮次：单核上提交方要等本线程让出这个核才能运行，自旋只会推迟它。有多个 CPU 时行为不变。线程启动后亲和性再变化不会重新读取。
+6. **自旋感知核数（2026-11-13 验收修订）：** 工作线程启动时用 `detail::cpus_available_to_this_thread()` 读取自己的 CPU 亲和性（Linux / Android 上是 `sched_getaffinity`，QNX 等其他平台退回 `hardware_concurrency`）。只有 1 个 CPU 时（`detail::pause_spin_useful` 为假），停车前的搜索跳过 pause 自旋，直接进入让出时间片的轮次：单核上提交方要等本线程让出这个核才能运行，自旋只会推迟它。有多个 CPU 时行为不变。线程启动后亲和性再变化不会重新读取。
 
 ### 5.5 `manual_executor`（保留，修改）
 
@@ -971,6 +971,8 @@ asio 版本是 `190a8d8`。
 | 告警 | 沿用 coro：`-Wall -Wextra -Wpedantic -Werror -Wconversion …` |
 
 每个组合的全部 ctest 项都必须通过。
+
+**交叉编译目标（2026-11-13 增补）：** Android（NDK r25c，arm64-v8a，Clang 14 + libc++）和 QNX 7.1（aarch64le，GCC 8.3 + libc++）在 C++14 / 17 / 20 下都要能编译、链接库和全部测试（`android-*`、`qnx-*` preset，工具链文件在 `cmake/toolchains/`）。没有 `<coroutine>` 的标准库上，原生协程作对照的测试（§14.2、§14.3 与 legacy 的 `differential_tests.cpp`）由 CMake 检测 `AW_HAVE_STD_COROUTINE` 后跳过。在目标机上运行测试不属于本矩阵的门禁。
 
 ### 14.6 并发压测（`tests/stress/`）
 

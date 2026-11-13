@@ -94,6 +94,36 @@ jobs:
       - name: Test
         run: ctest --preset ${{ matrix.preset }} --parallel 4 --timeout 300
 
+  android:
+    # 交叉编译库和全部测试（不运行：runner 上没有设备）。NDK 固定 r25c（Clang 14 + libc++），
+    # 与本地验证用的版本一致。
+    name: android-arm64 / C++${{ matrix.std }} (cross build)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        std: [14, 17, 20]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+      - name: Setup NDK r25c
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+          add-to-path: false
+      - name: Export ANDROID_NDK
+        run: echo "ANDROID_NDK=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+      - name: Configure
+        run: cmake --preset android-arm64-release -DAW_TEST_CXX_STANDARD=${{ matrix.std }}
+      - name: Build
+        run: cmake --build --preset android-arm64-release --parallel
+      - name: Check binaries are aarch64
+        run: file build/android-arm64-release/tests/unit/aw-awaitable-test | tee /dev/stderr | grep -q 'ARM aarch64'
+
   benchmarks:
     # 只在手动触发且勾选时运行；结果作为 artifact 上传，验收检查只打印、不让 job 失败（共享 runner 噪声大）。
     name: benchmarks (manual, non-gating)
