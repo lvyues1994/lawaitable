@@ -21,6 +21,9 @@ aw_contract_test(async_generator_two_next_contract_test)
 aw_contract_test(async_generator_destroy_active_contract_test)
 aw_unit_test(sync_wait_test)
 aw_contract_test(sync_wait_on_own_thread_contract_test)
+aw_unit_test(channel_test)
+aw_contract_test(channel_drop_zero_capacity_contract_test)
+aw_unit_test(channel_alloc_test)
 
 # §2.2：每个公共头都能单独包含（每个头生成一个只包含它两次的 TU）。
 file(GLOB_RECURSE AW_PUBLIC_HEADERS RELATIVE ${PROJECT_SOURCE_DIR}/include CONFIGURE_DEPENDS

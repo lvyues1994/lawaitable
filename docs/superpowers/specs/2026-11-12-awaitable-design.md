@@ -861,6 +861,7 @@ template <class T> T sync_wait(manual_executor& ctx, awaitable<T, manual_executo
 | `stop_source` / `stop_token` / `stop_callback` | 线程安全（与 coro 相同） |
 | 回收缓存 | 线程局部，不同步 |
 | `async_generator` | 与消费者在同一个执行线程上运行，不需要额外同步 |
+| `channel`（增补规格 `2026-11-13-channel-design.md`） | 除析构与 `set_drop_handler` 外线程安全（内部锁）；完成 post 到回调的关联 executor |
 
 ## 12. 与 asio 的逐项对照
 

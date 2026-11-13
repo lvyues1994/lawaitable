@@ -23,6 +23,8 @@
 #include "awaitable/async_generator.hpp"
 #include "awaitable/async_result.hpp"
 #include "awaitable/awaitable.hpp"
+#include "awaitable/channel.hpp"
+#include "awaitable/channel_error.hpp"
 #include "awaitable/co_spawn.hpp"
 #include "awaitable/detached.hpp"
 #include "awaitable/dispatch.hpp"

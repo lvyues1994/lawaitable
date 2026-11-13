@@ -1,7 +1,8 @@
 // §14.6：thread_pool、co_spawn 跨线程完成、strand、|| / && 的取消竞争、取消与完成同时到达、
-// sync_wait 两种顺序。用法：aw-stress-test <轮数>。
+// sync_wait 两种顺序；channel 的多生产者多消费者、外部线程丢帧、取消与发送竞争。用法：aw-stress-test <轮数>。
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -270,6 +271,142 @@ void sync_wait_round() {
     for (int i = 0; i != 20; ++i) AW_CHECK(aw::sync_wait(pool.get_executor(), later(&threads, i)) == i);
 }
 
+
+// ---- 7. channel：多生产者多消费者（block 策略，容量 0 / 1 / 8）----
+using int_channel = aw::channel<int, pool_ex>;
+
+auto chan_producer(int_channel* ch, int base, int n, std::atomic<int>* live)
+    CO2_BEG(pool_task<void>, (ch, base, n, live), int i{};) {
+    for (i = 0; i != n; ++i) CO2_AWAIT(ch->async_send(base + i, aw::use_awaitable));
+    if (live->fetch_sub(1) == 1) ch->close();
+    CO2_RETURN();
+}
+CO2_END
+
+auto chan_consumer(int_channel* ch, pool_ex ex, std::atomic<long>* sum, std::atomic<int>* count)
+    CO2_BEG(pool_task<void>, (ch, ex, sum, count), std::tuple<std::error_code, int> r{};) {
+    for (;;) {
+        CO2_AWAIT_SET(r, ch->async_receive(aw::as_tuple(aw::use_awaitable)));
+        AW_CHECK(ex.running_in_this_thread());
+        if (std::get<0>(r)) break;
+        sum->fetch_add(std::get<1>(r));
+        count->fetch_add(1);
+    }
+    AW_CHECK(std::get<0>(r) == aw::channel_errc::channel_closed);
+    CO2_RETURN();
+}
+CO2_END
+
+void channel_mpmc_round() {
+    for (std::size_t capacity : {std::size_t{0}, std::size_t{1}, std::size_t{8}}) {
+        aw::thread_pool pool{4U};
+        int_channel ch{pool, capacity};
+        constexpr int producers = 4, consumers = 4, per = 300;
+        std::atomic<int> live{producers};
+        std::atomic<long> sum{0};
+        std::atomic<int> count{0};
+        latch done{producers + consumers};
+        auto cb = [&](std::exception_ptr e) {
+            AW_CHECK(!e);
+            done.count_down();
+        };
+        for (int c = 0; c != consumers; ++c)
+            aw::co_spawn(pool, chan_consumer(&ch, pool.get_executor(), &sum, &count), cb);
+        for (int p = 0; p != producers; ++p) aw::co_spawn(pool, chan_producer(&ch, p * per, per, &live), cb);
+        done.wait();
+        constexpr int total = producers * per;
+        AW_CHECK(count.load() == total);
+        AW_CHECK(sum.load() == static_cast<long>(total) * (total - 1) / 2);
+    }
+}
+
+// ---- 8. channel：外部线程 try_send（drop_oldest / drop_newest），池上单消费者 ----
+auto chan_ordered_consumer(int_channel* ch, int* received, int* last, bool* ordered)
+    CO2_BEG(pool_task<void>, (ch, received, last, ordered), std::tuple<std::error_code, int> r{};) {
+    for (;;) {
+        CO2_AWAIT_SET(r, ch->async_receive(aw::as_tuple(aw::use_awaitable)));
+        if (std::get<0>(r)) break;
+        if (std::get<1>(r) <= *last) *ordered = false;
+        *last = std::get<1>(r);
+        ++*received;
+    }
+    CO2_RETURN();
+}
+CO2_END
+
+void channel_drop_foreign_round() {
+    for (aw::channel_policy policy : {aw::channel_policy::drop_oldest, aw::channel_policy::drop_newest}) {
+        aw::thread_pool pool{2U};
+        int_channel ch{pool, 4, policy};
+        int received = 0, last = -1;
+        bool ordered = true;
+        std::future<void> f = aw::co_spawn(pool, chan_ordered_consumer(&ch, &received, &last, &ordered), aw::use_future);
+        constexpr int n = 3000;
+        std::thread camera([&] {
+            for (int i = 0; i != n; ++i) AW_CHECK(ch.try_send(int{i}));
+            ch.close();
+        });
+        f.get();
+        camera.join();
+        AW_CHECK(ordered);
+        AW_CHECK(static_cast<std::uint64_t>(received) + ch.dropped() == static_cast<std::uint64_t>(n));
+        if (policy == aw::channel_policy::drop_oldest) AW_CHECK(last == n - 1); // 最新的帧总会送到
+    }
+}
+
+// ---- 9. channel：slot 取消与外部线程的发送竞争；不丢失、不重复 ----
+// 每个接收方在自己的 strand 上：emit（经 co_spawn 的取消桥 dispatch 到协程的 executor）与恢复时清 slot
+// 必须串行（§6.2 第 7 条），多线程池本身不提供这一点。
+auto chan_cancellable_receiver(int_channel* ch, std::atomic<long>* sum, std::atomic<int>* got, std::atomic<int>* aborted)
+    CO2_BEG(strand_task<void>, (ch, sum, got, aborted), std::tuple<std::error_code, int> r{};) {
+    CO2_AWAIT(aw::this_coro::reset_cancellation_state(aw::enable_total_cancellation{}));
+    CO2_AWAIT_SET(r, ch->async_receive(aw::as_tuple(aw::use_awaitable)));
+    if (!std::get<0>(r)) {
+        sum->fetch_add(std::get<1>(r));
+        got->fetch_add(1);
+    } else {
+        AW_CHECK(std::get<0>(r) == aw::error::operation_aborted);
+        aborted->fetch_add(1);
+    }
+    CO2_RETURN();
+}
+CO2_END
+
+void channel_cancel_race_round() {
+    aw::thread_pool pool{4U};
+    constexpr int n = 200;
+    int_channel ch{pool, static_cast<std::size_t>(n)};
+    std::atomic<long> sum{0};
+    std::atomic<int> got{0}, aborted{0};
+    latch done{n};
+    std::vector<std::unique_ptr<aw::cancellation_signal>> signals;
+    for (int i = 0; i != n; ++i) {
+        signals.emplace_back(new aw::cancellation_signal);
+        aw::co_spawn(aw::make_strand(pool.get_executor()), chan_cancellable_receiver(&ch, &sum, &got, &aborted),
+                     aw::bind_cancellation_slot(signals.back()->slot(), [&](std::exception_ptr e) {
+                         AW_CHECK(!e);
+                         done.count_down();
+                     }));
+    }
+    std::thread sender([&] {
+        for (int i = 0; i != n; ++i) AW_CHECK(ch.try_send(int{i}));
+    });
+    for (int i = 0; i != n; i += 2) signals[static_cast<std::size_t>(i)]->emit(aw::cancellation_type::total);
+    sender.join();
+    // 发送 n 个值、n 个接收方：没被取消的接收方一定拿到值，所以所有接收方都会结束。
+    // 守恒：拿到值的接收方个数 + 缓冲区剩余 = n，且和不变（不丢失、不重复）。
+    done.wait();
+    long rest = 0;
+    int left = 0;
+    while (auto v = ch.try_receive()) {
+        rest += *v;
+        ++left;
+    }
+    AW_CHECK(got.load() + aborted.load() == n);
+    AW_CHECK(got.load() + left == n);
+    AW_CHECK(sum.load() + rest == static_cast<long>(n) * (n - 1) / 2);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -281,7 +418,9 @@ int main(int argc, char** argv) {
     };
     item const items[] = {{"thread_pool", &thread_pool_round},       {"cross_thread", &cross_thread_round},
                           {"strand", &strand_round},                 {"operators", &operators_round},
-                          {"cancel_vs_complete", &cancel_vs_complete_round}, {"sync_wait", &sync_wait_round}};
+                          {"cancel_vs_complete", &cancel_vs_complete_round}, {"sync_wait", &sync_wait_round},
+                          {"channel_mpmc", &channel_mpmc_round},     {"channel_drop_foreign", &channel_drop_foreign_round},
+                          {"channel_cancel_race", &channel_cancel_race_round}};
     for (item const& it : items) {
         for (int r = 0; r != rounds; ++r) it.fn();
         std::printf("%s: %d rounds ok\n", it.name, rounds);

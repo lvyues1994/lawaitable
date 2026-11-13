@@ -3,6 +3,8 @@
 
 #include <asio.hpp>
 #include <asio/experimental/awaitable_operators.hpp>
+#include <asio/experimental/channel.hpp>
+#include <asio/experimental/concurrent_channel.hpp>
 
 #include <cstdio>
 #include <exception>
@@ -123,6 +125,21 @@ asio::awaitable<void> and_ready(long n) {
     w.stop(n);
 }
 
+// 增补 C9（只报告）：channel 往返，容量 1。channel 不是线程安全的；concurrent_channel 带锁（与 aw::channel 对应）。
+template <class Channel> asio::awaitable<void> chan_sender(Channel& ch, long total) {
+    for (long i = 0; i != total; ++i) co_await ch.async_send(asio::error_code{}, static_cast<int>(i), asio::use_awaitable);
+}
+
+template <class Channel> asio::awaitable<void> chan_receiver(Channel& ch, long n, char const* name) {
+    int v = 0;
+    for (long i = 0; i != bench::warmup; ++i) v = co_await ch.async_receive(asio::use_awaitable);
+    bench::window w{name};
+    w.start();
+    for (long i = 0; i != n; ++i) v = co_await ch.async_receive(asio::use_awaitable);
+    w.stop(n);
+    sink = v;
+}
+
 template <class A> void run_on(asio::io_context& io, A a) {
     asio::co_spawn(io, std::move(a), asio::detached);
     io.restart();
@@ -177,5 +194,21 @@ int main() {
     }
     run_on(io, or_ready(300000));
     run_on(io, and_ready(300000));
+    {
+        asio::experimental::channel<void(asio::error_code, int)> ch{io, 1};
+        long const n = 1000000;
+        asio::co_spawn(io, chan_sender(ch, bench::warmup + n), asio::detached);
+        asio::co_spawn(io, chan_receiver(ch, n, "channel_ping_pong"), asio::detached);
+        io.restart();
+        io.run();
+    }
+    {
+        asio::experimental::concurrent_channel<void(asio::error_code, int)> ch{io, 1};
+        long const n = 1000000;
+        asio::co_spawn(io, chan_sender(ch, bench::warmup + n), asio::detached);
+        asio::co_spawn(io, chan_receiver(ch, n, "channel_ping_pong_concurrent"), asio::detached);
+        io.restart();
+        io.run();
+    }
     return 0;
 }

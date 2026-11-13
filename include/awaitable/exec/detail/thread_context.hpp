@@ -31,9 +31,10 @@ enum class mem_tag : unsigned {
     awaitable_frame,
     executor_function,
     cancellation_signal,
-    parallel_group
+    parallel_group,
+    channel_op // channel 的等待节点（channel 规格增补 C7）
 };
-constexpr std::size_t mem_tag_count = 5U;
+constexpr std::size_t mem_tag_count = 6U;
 
 class thread_info {
   public:

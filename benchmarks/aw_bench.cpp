@@ -173,6 +173,25 @@ auto and_ready(long n) CO2_BEG(task<void>, (n), long i{}; std::tuple<int, int> r
 }
 CO2_END
 
+// 增补 C9（只报告）：channel 往返。同一 manual_executor 上一个发送协程、一个接收协程，容量 1。
+using int_channel = aw::channel<int, ex_t>;
+
+auto chan_sender(int_channel* ch, long total) CO2_BEG(task<void>, (ch, total), long i{};) {
+    for (i = 0; i != total; ++i) CO2_AWAIT(ch->async_send(static_cast<int>(i), aw::use_awaitable));
+    CO2_RETURN();
+}
+CO2_END
+
+auto chan_receiver(int_channel* ch, long n) CO2_BEG(task<void>, (ch, n), long i{}; int v{}; bench::window w{"channel_ping_pong"};) {
+    for (i = 0; i != bench::warmup; ++i) CO2_AWAIT_SET(v, ch->async_receive(aw::use_awaitable));
+    w.start();
+    for (i = 0; i != n; ++i) CO2_AWAIT_SET(v, ch->async_receive(aw::use_awaitable));
+    w.stop(n);
+    sink = v;
+    CO2_RETURN();
+}
+CO2_END
+
 template <class A> void run_on(aw::manual_executor& ctx, A a) {
     aw::co_spawn(ctx, std::move(a), aw::detached);
     ctx.run();
@@ -228,5 +247,12 @@ int main() {
     run_on(ctx, generator_1000(2000));
     run_on(ctx, or_ready(300000));
     run_on(ctx, and_ready(300000));
+    {
+        int_channel ch{ctx, 1};
+        long const n = 1000000;
+        aw::co_spawn(ctx, chan_sender(&ch, bench::warmup + n), aw::detached);
+        aw::co_spawn(ctx, chan_receiver(&ch, n), aw::detached);
+        ctx.run();
+    }
     return 0;
 }

@@ -11755,3 +11755,52 @@ git commit -m "thread_pool: skip pause spinning when the worker has a single CPU
 git add include tests/unit/awaitable_test.cpp benchmarks/results docs
 git commit -m "await_child fast path: inline cache hit with mask alignment, cheaper TLS, lazy exception_ptr (1.40x -> 1.09x)"
 ```
+
+---
+
+## 增补：有界 channel（2026-11-13，用户同意）
+
+规格：`docs/superpowers/specs/2026-11-13-channel-design.md`（C1–C9）。约束同前：core 原样、不改 /workspace/coro、只本地提交。
+
+### Task 21：channel 错误码与等待节点
+
+**Files:** Create `include/awaitable/channel_error.hpp`；Modify `include/awaitable/exec/detail/thread_context.hpp`（新增 `mem_tag::channel_op`）。
+1. 先写 `tests/unit/channel_test.cpp` 的错误码用例（类别名、消息、`== channel_errc::channel_closed`），编译失败。
+2. 实现后通过。
+
+### Task 22：channel 主体（缓冲、三种策略、close / cancel / slot 取消）
+
+**Files:** Create `include/awaitable/channel.hpp`、`include/awaitable/impl/channel_op.hpp`；Test `tests/unit/channel_test.cpp`、`tests/unit/channel_drop_zero_capacity_contract_test.cpp`。
+1. 按 C8 列出的用例逐个先写测试（manual_executor，确定性），确认失败。
+2. 实现 C2–C6：内部锁；锁内只动队列；锁外 post、drop 回调、元素析构；等待节点原子引用计数。
+3. 单元测试、契约测试通过。
+
+### Task 23：分配与并发
+
+**Files:** Test `tests/unit/channel_alloc_test.cpp`；Modify `tests/stress/stress_test.cpp`（场景 7）。
+1. 同线程稳态零分配断言（C7）。
+2. thread_pool MPMC、外部线程 try_send、随机 cancel / close；TSan 50 轮。
+
+### Task 24：视频流示例、总头文件、README
+
+**Files:** Create `examples/CMakeLists.txt`、`examples/video_stream.cpp`；Modify `CMakeLists.txt`（`AW_BUILD_EXAMPLES`）、`include/awaitable.hpp`、`README.md`。
+1. 相机线程固定帧率产生帧、池上消费者慢处理；三种策略各跑一遍，打印收到/丢弃/延迟；`drop_oldest` 演示把 channel 包成 `async_generator` 消费。
+2. 作为 ctest 运行，只断言不变量。
+
+### Task 25：基准（只报告）与收尾
+
+1. `benchmarks/aw_bench.cpp` / `asio_bench.cpp` 加 `channel_ping_pong`，结果写进 `benchmarks/results/`。
+2. `tools/run-matrix.sh` 12 配置全过；`tools/verify-core-verbatim.sh` 输出 `VERBATIM OK`；新测试 tsan 三个标准各 50 轮。
+3. Android / QNX preset 交叉编译新测试（用户电脑在线时）。
+4. 本地提交；bundle 同步到用户仓库（ff-only），不推送。
+
+**结果（2026-11-13）：**
+- 测试先写：channel_test / channel_alloc_test / 契约测试在头文件不存在时编译失败；实现后通过。alloc 测试用 `AW_DISABLE_RECYCLING_ALLOCATOR` 反证：缓存关时每条消息约 2 次分配，测试失败。
+- 压测场景 9 第一版把接收协程直接放在多线程池上，TSan / ASan 报 emit 与清 slot 的竞争：这是测试违反 §6.2 第 7 条（外部取消的协程要绑 strand），改为每个接收方一个 strand 后通过；规格 C4 第 3 条补上这条说明。
+- 12 配置全过（每配置 58 项：新增 channel_test、channel_alloc_test、契约测试、示例）；`VERBATIM OK`；tsan-cxx14/17/20 上 channel_test、channel_alloc_test、示例各 50 轮，压测 50 轮，0 失败。
+- 基准见 `benchmarks/results/2026-11-13-channel.md`。
+
+```bash
+git add -A include tests examples benchmarks docs tools CMakeLists.txt README.md
+git commit -m "channel: bounded MPMC channel with block / drop_oldest / drop_newest, slot cancellation, video stream example"
+```

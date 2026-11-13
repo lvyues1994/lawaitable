@@ -42,7 +42,8 @@ for lib in libs:
     data[lib] = {k: {"ns": statistics.median(v[0] for v in vs), "news": statistics.median(v[1] for v in vs),
                      "bytes": statistics.median(v[2] for v in vs)} for k, vs in per_item.items()}
 items = ["create_destroy", "await_child", "await_child_nested_1000", "bridge_same_thread", "bridge_cross_thread",
-         "co_spawn", "strand_post", "generator_yield_1000", "or_ready", "and_ready"]
+         "co_spawn", "strand_post", "generator_yield_1000", "or_ready", "and_ready",
+         "channel_ping_pong", "channel_ping_pong_concurrent"]
 json.dump({"compiler": compiler, "cpu": cpu, "runs": runs, "sizes": sizes, "results": data},
           open(out_stem + ".json", "w"), indent=2)
 def cell(lib, item):
