@@ -21,7 +21,8 @@ endif()
 # 在实例化点触发 -Wzero-as-null-pointer-constant；legacy 的 allocation_tests.cpp 用了 GCC 8
 # 还不认识的 -Wmismatched-new-delete，触发 -Wpragmas。这两条在 GCC 8 下只保留为警告。
 # 用目录级选项，使原样搬入的 legacy 测试也受影响。
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+# qcc / q++ 的编译器 ID 是 QCC（底层 GCC，版本号同 GCC），按 GCC 处理。
+if(CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|QCC)$" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
     add_compile_options(-Wno-error=zero-as-null-pointer-constant -Wno-error=pragmas)
 endif()
 
@@ -37,7 +38,7 @@ function(aw_configure_test target)
         # GCC 在 -O2/-O3 深度内联后对 optional / variant 存储和协程帧局部量的 -Wmaybe-uninitialized
         # 是已知的误报来源（Release 下 operators_test、async_generator_test 触发）；GCC 下保留警告、
         # 不作为错误。-Werror=uninitialized（确定未初始化）不受影响。
-        $<$<CXX_COMPILER_ID:GNU>:-Wno-error=maybe-uninitialized>)
+        $<$<CXX_COMPILER_ID:GNU,QCC>:-Wno-error=maybe-uninitialized>)
 endfunction()
 
 function(aw_test_target_name name out_var)

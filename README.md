@@ -16,7 +16,7 @@ co_spawn 与完成 token、`||` / `&&`，并保留 async_generator 与 thread_po
 | --- | --- | --- |
 | Linux x86_64 | GCC 14、Clang 18/20（libstdc++ / libc++） | CI 全矩阵：Debug / Release / ASan+UBSan / TSan × C++14/17/20 |
 | Android arm64-v8a / x86_64 | NDK r25c（Clang 14 + libc++，`android-24` 起） | 库与全部测试交叉编译通过（C++14/17/20）；CI 有 arm64 交叉编译 job |
-| QNX 7.1 aarch64le / x86_64 | SDP 7.1 的 qcc / q++（GCC 8.3 + LLVM libc++） | aarch64le：库与全部测试交叉编译通过（C++14/17/20，用 SDP 自带的 GCC 8.3 验证）；x86_64 preset 未验证；需要 QNX 许可证，不进 CI |
+| QNX 7.1 aarch64le / x86_64 | SDP 7.1 的 qcc / q++（GCC 8.3 + LLVM libc++） | 用 qcc 交叉编译库与全部测试通过：aarch64le Release C++14/17/20 + Debug C++17，x86_64 Release C++17；需要 QNX 许可证，不进 CI |
 
 交叉编译只构建库和测试可执行文件，测试要拷到目标机上运行（ctest 不会在主机上执行它们）。
 
@@ -28,6 +28,8 @@ cmake --build --preset android-arm64-release
 
 # QNX 7.1：先 source SDP 的环境脚本（导出 QNX_HOST / QNX_TARGET）
 source /path/to/qnx710/qnxsdp-env.sh
+# 许可证随 SDP 放在 <SDP>/.qnx/license 时（qnxsdp-env.sh 默认指向 ~/.qnx），把配置目录指过去
+export QNX_CONFIGURATION=/path/to/qnx710/.qnx QNX_CONFIGURATION_EXCLUSIVE=/path/to/qnx710/.qnx
 cmake --preset qnx-aarch64le-release -DAW_TEST_CXX_STANDARD=17
 cmake --build --preset qnx-aarch64le-release
 ```

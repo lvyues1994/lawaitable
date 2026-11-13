@@ -6,6 +6,15 @@ if(NOT DEFINED ENV{QNX_HOST} OR NOT DEFINED ENV{QNX_TARGET})
     message(FATAL_ERROR "QNX_HOST / QNX_TARGET 未设置：先 source <QNX SDP 7.1>/qnxsdp-env.sh")
 endif()
 
+# qcc 的许可证从 $QNX_CONFIGURATION/license 读取。qnxsdp-env.sh 把它设成 ~/.qnx；SDP 自带许可证
+# 目录的（如 <SDP>/.qnx/license），需要在 source 之后把 QNX_CONFIGURATION 和
+# QNX_CONFIGURATION_EXCLUSIVE 指过去（构建期间 ninja 调 qcc 时也要在环境里）。
+if(NOT EXISTS "$ENV{QNX_CONFIGURATION}/license/licenses")
+    message(WARNING "QNX_CONFIGURATION=$ENV{QNX_CONFIGURATION} 下没有 license/licenses，qcc 可能报 "
+                    "\"license check failed\"。SDP 自带许可证时：export QNX_CONFIGURATION=<SDP>/.qnx "
+                    "QNX_CONFIGURATION_EXCLUSIVE=<SDP>/.qnx")
+endif()
+
 set(CMAKE_SYSTEM_NAME QNX)
 set(CMAKE_SYSTEM_VERSION 7.1.0)
 set(CMAKE_SYSTEM_PROCESSOR ${AW_QNX_CPU})
