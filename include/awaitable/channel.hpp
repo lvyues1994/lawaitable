@@ -18,6 +18,8 @@
 #include "awaitable/core/detail/move_only_function.hpp"
 #include "awaitable/error.hpp"
 #include "awaitable/impl/channel_op.hpp"
+// error_code 一律经 make_error_code 构造：GCC 8 + libc++（QNX 7.1）下，从错误码枚举隐式构造会在
+// libc++ 的默认实参处触发 -Wzero-as-null-pointer-constant。
 #include "awaitable/optional.hpp"
 
 namespace aw {
@@ -247,7 +249,7 @@ template <class T, class Executor> class channel {
         finish(woken);
         handle_dropped(discarded);
         std::error_code const ec =
-            status == send_status::closed ? std::error_code{channel_errc::channel_closed} : std::error_code{};
+            status == send_status::closed ? make_error_code(channel_errc::channel_closed) : std::error_code{};
         detail::channel_post_send(ex_, std::forward<Handler>(handler), ec);
     }
 
@@ -265,7 +267,7 @@ template <class T, class Executor> class channel {
         if (!open_) {
             lock.unlock();
             detail::channel_post_receive<T>(ex_, std::forward<Handler>(handler),
-                                            std::error_code{channel_errc::channel_closed}, aw::optional<T>{});
+                                            make_error_code(channel_errc::channel_closed), aw::optional<T>{});
             return;
         }
         enqueue<handler_type, false>(std::forward<Handler>(handler), receivers_);
@@ -298,7 +300,7 @@ template <class T, class Executor> class channel {
         if (!n->queued.load(std::memory_order_relaxed)) return;
         (n->is_send ? senders_ : receivers_).erase(n);
         n->queued.store(false, std::memory_order_release);
-        n->ec = error::operation_aborted;
+        n->ec = error::make_error_code(error::operation_aborted);
         n->value.reset(); // 被取消的发送不入队；接收方本来就没有值
         lock.unlock();
         finish(n);
@@ -308,7 +310,7 @@ template <class T, class Executor> class channel {
         while (!list.empty()) {
             node* const n = list.pop();
             n->queued.store(false, std::memory_order_release);
-            n->ec = e;
+            n->ec = make_error_code(e);
             done.push(n);
         }
     }
